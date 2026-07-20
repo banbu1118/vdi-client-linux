@@ -2,12 +2,12 @@
 
 本文档记录基于 libfreerdp 构建最小化跨平台 RDP 客户端的工作计划与实际状态。
 
-> 目录：`/home/kk/vdi-client/VDIClient/`
+> 目录：`/home/administrator/VDIClient/`
 > - `qfreerdp-master/` — qf-client (QML + FreeRDP)
 > - `vdi-client-linux/` — VDIClient (Qt Widgets 登录/VM 管理)
 > - `freerdp-3.28.0/` — FreeRDP 源码及编译产物
 >
-> 构建配置参考：FreeRDP 3.28.0 Release 模式，CPU 转存帧缓冲 + GL 纹理上传，无 DMA-BUF/VAAPI，音频输入/输出均使用 FreeRDP 库自带的 PulseAudio 后端（通过 PipeWire），SDL 客户端生成（但未使用），X11/Wayland 客户端关闭。
+> 构建配置参考：FreeRDP 3.28.0 Release 模式（GCC 14 + `-O3 -DNDEBUG` + LTO），CPU 转存帧缓冲 + GL 纹理上传，无 DMA-BUF/VAAPI，音频输入/输出均使用 FreeRDP 库自带的 PulseAudio 后端（通过 PipeWire），X11/Wayland 客户端关闭。
 
 ## 架构概览
 
@@ -35,15 +35,22 @@ VDIClient (QWidgets)              qf-client (QML + FreeRDP)
 
 ### FreeRDP 3.28.0 当前编译配置
 
+**基础环境**：GCC 14 (`-O3 -DNDEBUG` + LTO 链接时优化 + PIC)，Release 模式，C11 标准，构建为共享库（不构建客户端/服务器可执行文件）。
+
 | 分类 | 开启 (ON) | 关闭 (OFF) |
 |------|-----------|------------|
-| **编解码** | FFmpeg H.264, DSP FFmpeg, SWScale, NSCodec (内置) | JPEG, OpenH264, GFX AV1, AOM, Opus, SoXR, LAME, AAC 系列, GSM, **VAAPI** |
-| **音频** | PulseAudio (主用, 通过 PipeWire) | ALSA, OSS |
-| **通道** | cliprdr, rdpsnd, rdpdr, drdynvc, rdpGFX, disp, rdpecam, urbdrc, audin, RAIL, smartcard, serial, parallel, printer, location, rdpei (多触点), ainput, video | TSMF (多媒体), SSH Agent, RDP2TCP, GFX 重定向 |
-| **客户端** | SDL 客户端 (未使用) | X11, Wayland 客户端 |
-| **其他** | CUPS, FUSE, PC/SC, cJSON, uriparser, OpenSSL, AAD (编译但 qf-client 未使用) | Kerberos, VAAPI |
+| **编解码** | FFmpeg H.264 (v61.19.101), DSP FFmpeg, SWScale (v8.3.100), NSCodec (内置) | JPEG, OpenH264, GFX AV1, AOM, Opus, SoXR, LAME, AAC 系列, GSM, **VAAPI** |
+| **音频** | PulseAudio (主用, 通过 PipeWire), ALSA (编译但 qf-client 不直接使用) | OSS |
+| **通道** | cliprdr, rdpsnd, rdpdr, drdynvc, rdpGFX, disp, rdpecam, urbdrc, audin, RAIL, rdpei (多触点), ainput, video, encomsp, echo, remdesk, location, geometry | TSMF (多媒体), SSH Agent, RDP2TCP, GFX 重定向, RDPEAR, RDPEWA |
+| **客户端通道** | drive, serial, parallel, smartcard (总开关 ON) | printer, rdpecam_client_stub, rdpemsc_client, telemetry_client |
+| **客户端** | client_common, client_channels | X11, Wayland, SDL 客户端, 可执行二进制 |
+| **其他** | FUSE3 (v3.17.2), OpenSSL (v3.5.6), PKCS11, UNICODE_BUILTIN, VERBOSE_WINPR_ASSERT, SIMD, AVX2, SMARTCARD_EMULATE | Kerberos, CUPS, AAD, cJSON, uriparser, LibreSSL, MbedTLS |
 
 > **VAAPI 当前关闭** (`WITH_VAAPI=OFF`)：因部分机型上 VAAPI 硬件解码偶发 SIGSEGV (exit code 11)，暂时回退到 CPU 软件解码。`libva-dev` 已安装，需要时可重新开启。
+>
+> **PRINTER_CLIENT 关闭**：`CHANNEL_PRINTER_CLIENT=OFF`，qf-client 不使用打印机重定向。
+>
+> **JSON 支持缺失**：cJSON/jansson/json-c 均未检测到，`WITH_WINPR_JSON=OFF`。
 
 ### VDIClient (Qt Widgets)
 
@@ -58,10 +65,11 @@ VDIClient (QWidgets)              qf-client (QML + FreeRDP)
 | 分类 | 说明 |
 |------|------|
 | 框架 | Qt 6 Core + Gui + Qml + Quick |
-| C++ 标准 | C++20 (qf-client 源码) / C23 (cliprdr C 源码) |
-| 编译器 | clang / clang++ |
+| C++ 标准 | C++20 (qf-client 源码) / C11 (cliprdr 等 C 源码) |
+| 编译器 | clang / clang++ (通过 Debian clang 19 验证) |
 | 日志 | spdlog + fmt |
-| FreeRDP | 自编译 3.28.0，通过 `CMAKE_PREFIX_PATH` 引用到 `freerdp-3.28.0/install/` |
+| FreeRDP | 自编译 3.28.0 (GCC 14)，通过 `CMAKE_PREFIX_PATH` 引用到 `freerdp-3.28.0/install/` |
+| 渲染 | GLESv2 + QSGRenderNode，CPU staging buffer + `glTexSubImage2D` 全帧上传 |
 
 ---
 
@@ -71,18 +79,18 @@ VDIClient (QWidgets)              qf-client (QML + FreeRDP)
 | --- | --- | --- | --- | --- | --- |
 | RDP 基础连接 | ✅ | ✅ | ✅ | libfreerdp 库完整集成 | `freerdp_new`+`freerdp_context_new`+`freerdp_connect`；PreConnect/PostConnect 回调配置参数；失败自动重试 3 次（间隔 500ms）；三态状态机支持重连 |
 | TLS/NLA/CredSSP 认证 | ✅ | ✅ 完整支持 | ⚠️ NLA 可用，证书跳过验证 | 缺少完整证书管理；`WITH_KRB5=OFF` 无 Kerberos | FreeRDP 内置 NLA (CredSSP)；`IgnoreCertificate=TRUE` 跳过证书校验 |
-| Microsoft Entra SSO | ✅ | ✅ | ❌ | 未实现；`WITH_AAD=ON` 已编译但 qf-client 未使用 | — |
+| Microsoft Entra SSO | ✅ | ✅ | ❌ | 未实现；`WITH_AAD=OFF` | — |
 | VDIClient 登录/VM 管理 | ❌ (mstsc 无独立登录器) | ❌ | ✅ **QWidgets 登录界面 + VM 列表管理** | 自研 VDI 管理客户端 | `LoginWindow` 管理：服务器健康检查、Token 认证、虚拟机列表/状态查询、开机/关机/重启/还原、心跳保活、多语言 |
 | 用户名密码登录 | ✅ | ✅ | ✅ ✅ **双重** | qf-client 和 VDIClient 各有一套凭据管理 | qf-client: `FreeRDP_Username`/`FreeRDP_Password`；VDIClient: REST API `/api/v1/auth/login` 获取 Token，记住密码 / 自动登录 |
-| Drive 重定向 | ✅ | ✅ `/drive` | ✅ | HOME → $HOME，CLI/.rdp 文件配置，未配置时自动添加默认 HOME 驱动 | `freerdp_client_add_device_channel(settings, 3, {"drive", "HOME", home})`；`FreeRDP_DeviceRedirection=TRUE` 通过 rdpdr 通道实现 |
-| USB 重定向 | ❌ (mstsc 原生不支持) | ✅ `/usb` | ✅ | URBDRC 通道 + libusb 枚举，由 CLI `/usb:` 或 .rdp 文件 `usbdevicestoredirect` 显式启用；默认禁用 | 标志持久化 + 首次连接时检测 + 重连时恢复 |
-| 摄像头重定向 | ✅ (Win10+) | ✅ `/camera` | ✅ | 默认重定向所有 V4L2 摄像头设备 (`device:*`) | `freerdp_client_add_dynamic_channel(settings, 2, {RDPECAM_DVC_CHANNEL_NAME, "device:*"})` |
+| Drive 重定向 | ✅ | ✅ `/drive` | ✅ | HOME → $HOME，CLI/.rdp 文件配置，未配置时自动添加默认 HOME 驱动；重连时通过 `g_saved_drive_args` 恢复 | `freerdp_client_add_device_channel(settings, 3, {"drive", "HOME", home})`；`FreeRDP_DeviceRedirection=TRUE` 通过 rdpdr 通道实现 |
+| USB 重定向 | ❌ (mstsc 原生不支持) | ✅ `/usb` | ✅ | URBDRC 通道 + libusb 枚举，由 CLI `/usb:` 或 .rdp 文件 `usbdevicestoredirect` 显式启用；默认禁用 | 标志持久化 + 首次连接时检测 + 重连时恢复；热插拔线程 `LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED/LEFT` |
+| 摄像头重定向 | ✅ (Win10+) | ✅ `/camera` | ✅ | **硬编码启用**，默认重定向所有 V4L2 摄像头设备 (`device:*`)，无运行时 UI 控制 | `freerdp_client_add_dynamic_channel(settings, 2, {RDPECAM_DVC_CHANNEL_NAME, "device:*"})` |
 | 多显示器 | ✅ `/multimon`（最多 16 屏） | ✅ `/multimon` | ⚠️ 基础单屏分辨率变化 | 缺少多 Monitor Layout 支持 | disp DVC `SendMonitorLayout` 发送单个 primary 布局 |
 | 选择显示器 | ✅ | ✅ | ❌ | 未实现 | — |
 | 多屏切换 | ✅ | ✅ | ❌ | 未实现 | — |
-| 动态分辨率 | ❌（mstsc 不支持） | ✅ | ✅ **300ms 消抖 + 4px 对齐 + 全帧上传 + glViewport 显式设置** | 窗口调整后 RDP 分辨率自动同步 | disp DVC `SendMonitorLayout` → GFX_RESET；300ms QTimer 消抖；4px 对齐请求；**取消 DMA-BUF 后**采用全帧 `glTexSubImage2D` 上传（避免跨 stride 脏矩形的复杂度）；`RenderNode::render()` 中 `glViewport(0,0,vpW,vpH)` 覆盖 Qt 场景图缓存的旧视口 |
+| 动态分辨率 | ❌（mstsc 不支持） | ✅ | ✅ **300ms 消抖 + 4px 对齐 + 全帧上传 + glViewport 显式设置** | 窗口调整后 RDP 分辨率自动同步 | disp DVC `SendMonitorLayout` → GFX_RESET；300ms QTimer 消抖；4px 对齐请求；全帧 `glTexSubImage2D` 上传；`RenderNode::render()` 中 `glViewport(0,0,vpW,vpH)` 覆盖 Qt 场景图缓存的旧视口 |
 | 字体平滑 (ClearType) | ✅ | ✅ | ✅ | 显式启用 | `FreeRDP_AllowFontSmoothing=TRUE`；PerformanceFlags 发送 PERF_ENABLE_FONT_SMOOTHING 位 |
-| RD Gateway (TSG) | ✅ | ✅ `/g:` | ✅ | PAA token 认证，网关隧道通过 TSG 协议建立 | `GatewayHostname`/`GatewayPort`/`GatewayAccessToken`/`GatewayCredentialsSource=5` |
+| RD Gateway (TSG) | ✅ | ✅ `/g:` | ✅ | PAA token 认证，网关隧道通过 TSG 协议建立；代码层仅调低 WLog 级别，依赖 FreeRDP CLI 解析 | `GatewayHostname`/`GatewayPort`/`GatewayAccessToken`/`GatewayCredentialsSource=5` |
 | Restricted Admin 模式 | ✅ | ✅ `/restricted-admin` | ❌ | 未实现 | — |
 | Remote Credential Guard | ✅ | ✅（3.9+） | ❌ | 未实现 | — |
 | Pass-the-Hash 登录 | ❌ | ✅ `/pth:hash` | ❌ | 未实现 | — |
@@ -98,20 +106,23 @@ VDIClient (QWidgets)              qf-client (QML + FreeRDP)
 | 无边框全屏 | ❌ | ✅ | ❌ | 已切回系统原生标题栏（用户要求） | 使用系统原生窗口装饰 |
 | 悬浮工具栏（连接栏） | ✅（顶部固定连接栏） | ✅ | ✅ | 5px 顶部居中热区 + 3s 自动隐藏 + 图钉固定 + CAD/USB/全屏/最小化按钮 | QML `MouseArea` 检测 → 显示工具栏 → 离开启动 3s 隐藏定时器 |
 | 多窗口模式 | ✅（多个 mstsc） | ✅ | ❌ | 未实现 | — |
-| RemoteApp | ✅ | ✅ | ❌ | 未实现；`CHANNEL_RAIL=ON` 已编译 | — |
+| RemoteApp | ✅ | ✅ | ❌ | 未实现；`CHANNEL_RAIL=ON` 已编译但未使用 | — |
 | RemoteApp 无缝窗口 | ✅ | ✅ | ❌ | 未实现 | — |
 | 远程协助 / 会话影子 | ✅ | ✅ | ❌ | 未实现 | — |
 | 鼠标输入 | ✅ | ✅ | ✅ | 坐标缩放映射到 RDP 分辨率 | `mouseEventScaleSend()` → `freerdp_input_send_mouse_event()` |
 | 相对鼠标模式 | ✅ | ✅ | ❌ | 未实现 | — |
 | 鼠标捕获 | ✅ | ✅ | ❌ | 未实现 | — |
-| RDP Pointer（光标通道） | ✅ | ✅ | ✅ | 完整实现：Pointer 六回调 + XOR/AND 解码 + unordered_map 缓存 + SYSPTR_NULL 自动隐藏 + 3px 移动阈值恢复 | `graphics_register_pointer` 六回调；`freerdp_image_copy_from_pointer_data()` 解码 → QCursor |
+| 鼠标侧键 (XButton1/2) | ✅ | ✅ | ❌ | 未实现 | — |
+| RDP Pointer（光标通道） | ✅ | ✅ | ✅ | 完整实现：Pointer 六回调 + XOR/AND 解码 + unordered_map 缓存 + SYSPTR_NULL 自动隐藏 + 3px 移动阈值恢复 + 2000ms 防抖 | `graphics_register_pointer` 六回调；`freerdp_image_copy_from_pointer_data()` 解码 → QCursor |
 | 键盘扫描码 | ✅ | ✅ | ✅ | 一致 | `qf::to_freerdp_key_code()` 查找表 → `freerdp_input_send_keyboard_event_ex()` |
 | Unicode 输入 | ✅ | ✅ | ✅ | 扫描码回退到 Unicode | 键码映射失败时回退到 `freerdp_input_send_unicode_keyboard_event()` |
 | 输入法 IME | ✅ | ⚠️ | ❌ | 中文输入可能有问题 | 未实现 IME 专用通道 |
+| 触屏 / 多点触控 | ✅ | ✅ | ❌ | 未实现；`CHANNEL_RDPEI=ON` 已编译但未使用 | — |
+| 触笔（Pen）输入 | ✅ | ✅ | ❌ | 未实现 | — |
 | 粘贴文本 | ✅ | ✅ | ✅ **由 `/clipboard` 参数控制，默认禁用** | 一致 | cliprdr 通道；由 CLI 参数 `/clipboard` 控制（默认禁用） |
 | 剪贴板图片 | ✅（PNG/DIB/DIBV5） | ✅ | ✅ **由 `/clipboard` 参数控制，默认禁用** | 一致 | cliprdr 通道：PNG/DIB/DIBV5 → `QImage::fromData()`/`imageFromDib()` → `QClipboard::setImage()` |
-| 剪贴板文件 | ✅ | ✅ | ✅ **由 `/clipboard` 参数控制，默认禁用** | 一致 | `FileGroupDescriptorW` 解析 → 独立工作线程 64KB 分块下载；由 `/clipboard` 控制 |
-| 麦克风输入（音频输入） | ✅ | ✅ | ✅ | audin DVC + FreeRDP 库自带 PulseAudio 后端 → PipeWire | `freerdp_client_add_dynamic_channel(settings, 2, {AUDIN_CHANNEL_NAME, "sys:pulse"})`；addin provider 为简单链式转发，无自编译后端 |
+| 剪贴板文件 | ✅ | ✅ | ✅ **由 `/clipboard` 参数控制，默认禁用** | 一致 | `FileGroupDescriptorW` 解析 → 独立工作线程 64KB 分块下载；由 `/clipboard` 控制；`cliprdr_file_context_new` + `clipboard_entry` worker |
+| 麦克风输入（音频输入） | ✅ | ✅ | ✅ | audin DVC + FreeRDP 库自带 PulseAudio 后端 → PipeWire；**硬编码启用**，无运行时 UI 控制 | `freerdp_client_add_dynamic_channel(settings, 2, {AUDIN_CHANNEL_NAME, "sys:pulse"})`；addin provider 为简单链式转发，无自编译后端 |
 | RDPSND 声音输出 | ✅ | ✅ | ✅ | FreeRDP 库自带 PulseAudio 后端 → PipeWire | FreeRDP 编译时 `WITH_PULSE=ON`，rdpsnd 走库内 pulse 后端（`libfreerdp-client3.so` 中的 `rdpsnd_pulse.c`）；PCM 8/16 位音频播放；`pulse->stream=(nil)` 警告偶发时检查 PipeWire 是否运行 |
 | 动态虚拟通道 DVC | ✅ | ✅ | ✅ | rdpsnd/GFX/disp/cliprdr/urbdrc/ecam/audin DVC 均已使用 | 通过 `freerdp_client_add_dynamic_channel` 注册；`ChannelConnected` 回调保存上下文 |
 | 多触点（Multi-Touch） | ✅ | ✅ | ❌ | 未实现；`CHANNEL_RDPEI=ON` 已编译但未使用 | — |
@@ -126,13 +137,13 @@ VDIClient (QWidgets)              qf-client (QML + FreeRDP)
 | UDP Transport | ✅（RDP 10 UDP 优先） | ✅ | ✅ | SupportMultitransport=TRUE | UDP 优先，失败回退 TCP |
 | RDPEUDP2 | ✅ | ✅ | ✅ | SupportMultitransport=TRUE 时自动协商 | — |
 | TCP fallback | ✅ | ✅ | ✅ | 默认 | TCP；`TcpConnectTimeout=5s` |
-| Smartcard Login | ✅ | ✅ | ❌ | 未实现 | — |
+| Smartcard Login | ✅ | ✅ | ❌ | 未实现；`CHANNEL_SMARTCARD=ON` 但 `SMARTCARD_PCSC=ON` 仅总开关 | — |
 | Kerberos SSO | ✅ | ✅ | ❌ | 不可用；`WITH_KRB5=OFF` | — |
 | Windows Hello | ✅（Win10+） | ⚠️ | ❌ | 未实现 | — |
 | GPO 策略兼容 | ✅ | ✅ | 依赖协议 | 未验证 | — |
 | 多会话管理 | ❌ 客户端职责 | ❌ 客户端职责 | ✅ **VDIClient VM 列表管理** | 完整的 VDI 虚拟机列表管理 | VDIClient 通过 REST API 管理多个 VM 的开机/关机/重启/恢复/连接 |
 | 断线重连 | ✅（自动重连） | ⚠️ | ✅ | 三态状态机 + 3 次重试 + 重连后清理上下文 | `WaitForMultipleObjects` 100ms 轮询 → `freerdp_shall_disconnect_context`/`g_reconnectRequested`（USB 切换触发）→ `freerdp_disconnect`+`freerdp_connect` 最多 3 次 |
-| 自动恢复 Session | ⚠️ | ⚠️ | ✅ | `freerdp_disconnect` → `freerdp_connect` → my_pre_connect 清理旧设备/通道 → my_post_connect 重新初始化 GDI/指针回调 | 重连时 channel contexts 已释放：`my_pre_connect()` 中 `freerdp_device_collection_free()`+`freerdp_dynamic_channel_collection_free()` 清理旧设备；`g_dispContext/g_gfxContext` 置空防止残指针回调 |
+| 自动恢复 Session | ⚠️ | ⚠️ | ✅ | `freerdp_disconnect` → `freerdp_connect` → my_pre_connect 清理旧设备/通道 → my_post_connect 重新初始化 GDI/指针回调 | 重连时 channel contexts 已释放：`my_pre_connect()` 中 `freerdp_device_collection_free()`+`freerdp_dynamic_channel_collection_free()` 清理旧设备；`g_dispContext/g_gfxContext/g_clipboard_client_context` 置空防止残指针回调 |
 | 联网认证—Token 过期处理 | ✅ | ✅ | ✅ **VDIClient 处理** | Token 过期自动返回登录页、终止 RDP 进程 | VDIClient `isTokenExpired()` 检测 HTTP 401 → `handleTokenExpired()`: 清 Token、终止 qf-client、切回登录页 |
 | VDI—快照管理 | ❌ (mstsc 无此功能) | ❌ | ✅ | 通过 REST API 查询/恢复 Milestone 快照 | VDIClient `fetchVmSnapshot()` → `onVmSnapshotReply()` 显示/隐藏还原按钮 |
 | VDI—心跳保活 | ❌ | ❌ | ✅ | 每 15 秒发送心跳维持会话 | VDIClient `startHeartbeat()` → QTimer 15s → `/api/v1/users/heartbeat` POST |
@@ -149,7 +160,7 @@ VDIClient (QWidgets)              qf-client (QML + FreeRDP)
 | Alternate Shell | ✅ | ✅ `/shell:...` | ❌ | 未实现 | — |
 | 公共模式（Public Mode） | ✅ `/public` | ✅ | ❌ | 未实现 | — |
 | 日志系统 | ✅ | CLI 日志 | ✅ **spdlog/fmt + VDIClient 日志** | qf-client: spdlog 5 级日志；VDIClient: `qInfo()/qWarning()` 日志 | 两份日志独立输出 |
-| 参数配置文件 / CLI | ✅（.rdp 文件） | cmd 参数 | ✅ | `freerdp_client_settings_parse_command_line()` 解析 | 在 `my_pre_connect()` 中执行一次（初始连接）；`g_cli_argc/g_cli_argv` 全局变量保存 |
+| 参数配置文件 / CLI | ✅（.rdp 文件） | cmd 参数 | ✅ | `freerdp_client_settings_parse_command_line()` 解析 | 在 `my_pre_connect()` 中执行一次（初始连接）；`g_cli_argc/g_cli_argv` 全局变量保存；重连时跳过解析但恢复 `/drive:` `/usb:` 配置 |
 | 交替 Shell / 启动程序 | ✅ | ✅ | ❌ | 未实现 | — |
 | Public Mode (公共模式) | ✅ | ✅ | ❌ | 未实现 | — |
 | KDC Proxy | ✅ | ✅ `/kdcproxy` | ❌ | 未实现 | — |
@@ -175,6 +186,8 @@ VDIClient (QWidgets)              qf-client (QML + FreeRDP)
 | **VDIClient 启动路径泛化** | 硬编码了 `window-resize/` 中间路径 | 改为基于 `applicationDirPath()` 向上查找 `bin/` 目录 | ✅ 支持不同部署目录结构 |
 | **初始分辨率使用屏幕尺寸** | QML 窗口还未 mapped 时 item size 很小，导致 RDP session 初始分辨率过小 | `start_rdp_connection()` 中用 `screen->availableGeometry()` 而非 item size | ✅ 初始 RDP session 为合理大分辨率 |
 | **分辨率 4px 对齐** | RDP 服务器将请求分辨率对齐到 4 的倍数，不匹配导致黑边 | 请求前 `(w+3)&~3u` 预对齐 | ✅ 请求分辨率与服务器返回一致 |
+| **片段着色器 Alpha 强制不透明** | GDI buffer 使用 BGRX32 格式（Alpha 为未初始化的填充字节），但 GL 纹理按 RGBA 上传，着色器直接使用随机 Alpha 值导致 Win7/Win10 拖动窗口时局部出现半透明方块 | 片段着色器中 `fragColor.a = 1.0` 强制 Alpha 不透明 | ✅ Win7 半透明方块消除 |
+| **Staging Buffer Alpha 初始化** | `resizeStagingBuffer()` 中 `std::vector::resize()` 分配新内存但不初始化，Win10 GFX 管道增量更新导致未更新区域保留垃圾 Alpha 值 | 缓冲区分配后遍历所有 Alpha 字节（第 4 字节）设置为 `0xFF` | ✅ Win10 半透明方块消除 |
 
 ### 架构变更记录
 
@@ -187,6 +200,7 @@ VDIClient (QWidgets)              qf-client (QML + FreeRDP)
 | k4 | 移除 DMA-BUF | EGL/GBM 偶发崩溃 |
 | k5 | 窗口花屏优化 | 纹理上传错位修复 |
 | k6 | 音频后端重构 | rdpsnd（播放）和 audin（麦克风）从 qf-client 内置后端改为 FreeRDP 库自带 PulseAudio 后端（通过 PipeWire）。移除 `rdpsnd-src/`（~2500 行）和 `audin-src/`（~500 行）自编译源码。 |
+| k7 | 渲染透明度修复 | 修复 Win7/Win10 拖动窗口时局部出现半透明方块的问题（片段着色器强制 `fragColor.a=1.0` + staging buffer Alpha 初始化） |
 | 当前 | CPU staging buffer + GL 纹理 + 全帧上传 | 稳定优先 |
 
 ### 已知瓶颈
@@ -214,10 +228,12 @@ VDIClient (QWidgets)              qf-client (QML + FreeRDP)
 FreeRDP 3.28.0 的完整 CMake 配置见 `freerdp-3.28.0/build/CMakeCache.txt`。选编编译选项：
 
 ```bash
-cd /home/kk/vdi-client/VDIClient/freerdp-3.28.0
+cd /home/administrator/VDIClient/freerdp-3.28.0
 
 cmake -S . -B build \
   -DCMAKE_INSTALL_PREFIX="$PWD/install" \
+  -DCMAKE_C_COMPILER=gcc \
+  -DCMAKE_CXX_COMPILER=g++ \
   -DCMAKE_BUILD_TYPE=Release \
   -DWITH_ALSA=ON \
   -DWITH_PULSE=ON \
@@ -229,6 +245,7 @@ cmake -S . -B build \
   -DWITH_WAYLAND=OFF \
   -DWITH_SERVER=OFF \
   -DWITH_CLIENT=OFF \
+  -DWITH_CCACHE=OFF \
   -DWITH_SAMPLE=OFF \
   -DWITH_KRB5=OFF \
   -DWITH_CUPS=OFF \
