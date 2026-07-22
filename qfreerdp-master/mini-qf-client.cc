@@ -789,7 +789,8 @@ UINT qf_CliprdrServerFormatDataRequestCallBack(CliprdrClientContext* context,
 
 	if (mimeData->hasText() && formatDataRequest->requestedFormatId == CF_UNICODETEXT)
 	{
-		const char16_t* rawData = reinterpret_cast<const char16_t*>(mimeData->text().utf16());
+		const QString text = mimeData->text();
+		const char16_t* rawData = reinterpret_cast<const char16_t*>(text.utf16());
 		UINT32 dataLen = (std::char_traits<char16_t>::length(rawData) + 1) * sizeof(char16_t); // 16bit char
 		RemoteFormatDataResponse(reinterpret_cast<const BYTE*>(rawData), dataLen);
 
@@ -846,7 +847,13 @@ UINT qf_CliprdrServerFormatDataRequestCallBack(CliprdrClientContext* context,
 	}
 	else if (mimeData->hasUrls() && formatDataRequest->requestedFormatId == qf::CLIPBOARD_FORMAT_FILE)
 	{
-		const size_t fileCount = g_client->clipboard_info_files_.size();
+		std::vector<qf::clipboard_info_file_t> filesCopy;
+		{
+			std::lock_guard<std::mutex> lock(g_client->clipboard_info_files_mutex_);
+			filesCopy = g_client->clipboard_info_files_;
+		}
+
+		const size_t fileCount = filesCopy.size();
 		if (fileCount == 0)
 		{
 			qf::log::warn("cliprdr/file-list", "no local file list for FileGroupDescriptorW request");
@@ -857,7 +864,7 @@ UINT qf_CliprdrServerFormatDataRequestCallBack(CliprdrClientContext* context,
 		std::vector<FILEDESCRIPTORW> fds(fileCount);
 		for (size_t i = 0; i < fileCount; ++i)
 		{
-			const auto& file_info = g_client->clipboard_info_files_[i];
+			const auto& file_info = filesCopy[i];
 			const UINT64 fileSize = file_info.is_directory_ ? 0 : file_info.total_;
 			fds[i].nFileSizeLow = static_cast<DWORD>(fileSize & 0xFFFFFFFFULL);
 			fds[i].nFileSizeHigh = static_cast<DWORD>((fileSize >> 32) & 0xFFFFFFFFULL);
@@ -1075,6 +1082,7 @@ void qf_channel_connected_callback(void* context, const ChannelConnectedEventArg
 
 void qf_channel_disconnected_callback(void* context, const ChannelDisconnectedEventArgs* event)
 {
+	freerdp_client_OnChannelDisconnectedEventHandler(context, event);
 }
 
 static void qf_print_static_channels(rdpSettings* settings)

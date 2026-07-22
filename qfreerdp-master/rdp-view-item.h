@@ -362,11 +362,7 @@ public:
         }
 
         /* Mark dirty region for render thread upload */
-        m_dirtyX = rx;
-        m_dirtyY = ry;
-        m_dirtyW = rw;
-        m_dirtyH = rh;
-        m_uploadNeeded.store(true, std::memory_order_release);
+		m_uploadNeeded.store(true, std::memory_order_release);
     }
 
     /* Called from Qt main thread (via QueuedConnection from noop_end_paint).
@@ -787,19 +783,22 @@ public:
     }
 
     void appendClipboardInfoFile(const QFileInfo& root, const QFileInfo& fileInfo) {
-        qf::clipboard_info_file_t c;
-        c.display_name_ = clipboardDisplayName(root, fileInfo);
-        c.local_path_ = fileInfo.absoluteFilePath(); c.total_ = fileInfo.size(); c.is_directory_ = fileInfo.isDir();
-        auto it = std::find_if(m_qfClientContext->clipboard_info_files_.begin(),
-            m_qfClientContext->clipboard_info_files_.end(),
-            [&](const qf::clipboard_info_file_t& f){ return f.local_path_ == fileInfo.absoluteFilePath(); });
-        if (it == m_qfClientContext->clipboard_info_files_.end())
-            m_qfClientContext->clipboard_info_files_.push_back(c);
-        if (!fileInfo.isDir()) return;
-        QDir dir(fileInfo.absoluteFilePath());
-        for (const QString& f : dir.entryList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot))
-            appendClipboardInfoFile(root, QFileInfo(dir.filePath(f)));
-    }
+		qf::clipboard_info_file_t c;
+		c.display_name_ = clipboardDisplayName(root, fileInfo);
+		c.local_path_ = fileInfo.absoluteFilePath(); c.total_ = fileInfo.size(); c.is_directory_ = fileInfo.isDir();
+		{
+			std::lock_guard<std::mutex> lock(m_qfClientContext->clipboard_info_files_mutex_);
+			auto it = std::find_if(m_qfClientContext->clipboard_info_files_.begin(),
+				m_qfClientContext->clipboard_info_files_.end(),
+				[&](const qf::clipboard_info_file_t& f){ return f.local_path_ == fileInfo.absoluteFilePath(); });
+			if (it == m_qfClientContext->clipboard_info_files_.end())
+				m_qfClientContext->clipboard_info_files_.push_back(c);
+		}
+		if (!fileInfo.isDir()) return;
+		QDir dir(fileInfo.absoluteFilePath());
+		for (const QString& f : dir.entryList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot))
+			appendClipboardInfoFile(root, QFileInfo(dir.filePath(f)));
+	}
 
     void dataChangedCallback() {
         if (!m_qfClientContext) return;
@@ -815,7 +814,11 @@ public:
         QClipboard* cb = QGuiApplication::clipboard();
         const QMimeData* md = cb->mimeData();
         if (md->hasUrls()) {
-            QByteArray uriList; m_qfClientContext->clipboard_info_files_.clear();
+            QByteArray uriList;
+            {
+                std::lock_guard<std::mutex> lock(m_qfClientContext->clipboard_info_files_mutex_);
+                m_qfClientContext->clipboard_info_files_.clear();
+            }
             for (const QUrl& url : md->urls()) {
                 if (url.isLocalFile()) {
                     QFileInfo file(url.toLocalFile());
@@ -859,7 +862,6 @@ private:
 
     /* Dirty rect tracking for incremental texture upload */
     std::atomic<bool>    m_uploadNeeded{false};
-    int                  m_dirtyX = 0, m_dirtyY = 0, m_dirtyW = 0, m_dirtyH = 0;
 
     /* GL resources — atomically published for render thread access */
     std::atomic<GLuint>  m_glTexture{0};

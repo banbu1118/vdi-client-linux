@@ -232,12 +232,13 @@ UINT channel_client_quit_handler(void* MsgsHandle)
 	{
 		if (internals->queue && internals->thread)
 		{
-			if (MessageQueue_PostQuit(internals->queue, 0) &&
-			    (WaitForSingleObject(internals->thread, INFINITE) == WAIT_FAILED))
+			if (MessageQueue_PostQuit(internals->queue, 0))
 			{
-				rc = GetLastError();
-				WLog_ERR(TAG, "WaitForSingleObject failed with error %" PRIu32 "", rc);
-				return rc;
+				if (WaitForSingleObject(internals->thread, INFINITE) == WAIT_FAILED)
+				{
+					rc = GetLastError();
+					WLog_ERR(TAG, "WaitForSingleObject failed with error %" PRIu32 "", rc);
+				}
 			}
 		}
 	}

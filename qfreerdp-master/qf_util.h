@@ -158,6 +158,7 @@ inline UINT to_freerdp_key_code(const QKeyEvent* event)
 
         wClipboard* clipboard_system_ = nullptr;
         std::vector<clipboard_info_file_t> clipboard_info_files_;
+        std::mutex clipboard_info_files_mutex_;  // 保护 clipboard_info_files_ 的互斥锁
         CliprdrFileContext* cliprdr_file_context_ = nullptr;
         RdpViewItem* rdpViewItem = nullptr;
         
