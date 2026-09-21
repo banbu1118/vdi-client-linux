@@ -96,6 +96,12 @@ typedef struct
 	wStream* sampleRespBuffer;
 
 	FREERDP_VIDEO_CONTEXT* video;
+
+	/* 上报给服务端的媒体类型清单快照，Format 字段保留采集侧(输入)格式。
+	 * 发送给服务端前每个条目的 Format 会被改写为 outputFormat，服务端回传的也是改写后的值，
+	 * 因此服务端选定某个条目时只能靠 (width,height,fps) 反查回真实的采集格式。 */
+	CAM_MEDIA_TYPE_DESCRIPTION reportedMediaTypes[ECAM_MAX_MEDIA_TYPE_DESCRIPTORS];
+	size_t nReportedMediaTypes;
 } CameraDeviceStream;
 
 WINPR_ATTR_NODISCARD

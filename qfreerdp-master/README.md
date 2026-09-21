@@ -55,7 +55,7 @@ interface, so a local copy in [ref-tmp](ref-tmp) is used for the clipboard chann
 ## Build
 
 ```bash
-cd /home/kk/vdi-client/VDIClient/qfreerdp-master
+cd /home/kk/vdi-client-linux-tmp-20260916/vdi-client-linux/qfreerdp-master
 
 # Configure (uses clang, finds FreeRDP from ../freerdp-3.28.0/install/)
 cmake -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -B build .

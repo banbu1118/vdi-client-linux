@@ -741,6 +741,10 @@ ADDIN_ARGV* freerdp_addin_argv_new(size_t argc, const char* const argv[])
 	{
 		for (size_t x = 0; x < argc; x++)
 		{
+			/* optional arguments may be nullptr (e.g. RDPDR_DRIVE automount),
+			 * keep the slot empty instead of failing the whole argument list */
+			if (!argv[x])
+				continue;
 			args->argv[x] = _strdup(argv[x]);
 			if (!args->argv[x])
 				goto fail;

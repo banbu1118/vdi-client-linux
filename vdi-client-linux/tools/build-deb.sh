@@ -2,11 +2,11 @@
 # ===========================================================================
 # VDI Client DEB 包构建脚本
 # 用法: sudo ./build-deb.sh [版本号]
-# 默认版本: 1.0.0
+# 默认版本: 1.6.1
 # ===========================================================================
 set -euo pipefail
 
-VERSION="${1:-1.5.0}"
+VERSION="${1:-1.6.1}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BASE_DIR="$(realpath "$SCRIPT_DIR/..")"
 PARENT_DIR="$(realpath "$BASE_DIR/..")"
@@ -40,6 +40,8 @@ Section: net
 Priority: optional
 Architecture: ${ARCH}
 Depends: qml6-module-qtquick-controls,
+         libqt6dbus6,
+         libwayland-client0,
          libspdlog1.15,
          libusb-1.0-0,
          libpulse0,
@@ -140,6 +142,25 @@ Exec=/usr/bin/vdi-client
 Icon=vdi-client
 Terminal=false
 Type=Application
+Categories=Network;RemoteAccess;
+DESKTOP
+
+# qf-client 是 VDIClient 拉起的 RDP 子进程，Wayland 下它的 app_id 来自
+# QGuiApplication::setDesktopFileName("qf-client")，GNOME 记录"允许抑制快捷键"
+# 的授权时按这个 app_id 匹配，因此必须随包安装。
+# 注意：不能加 NoDisplay=true —— gnome-shell 用 g_app_info_should_show() 过滤应用，
+# 带 NoDisplay 的 desktop 文件不会进入 app system，窗口会被当成 window-backed app，
+# 于是授权永远存不下来、每次连接都弹"是否允许抑制快捷键"。
+# Exec 指向的 /usr/bin/qf-client 也必须存在（GLib 会校验 Exec 能否在 PATH 找到）。
+cat > "$PKG_DIR/usr/share/applications/qf-client.desktop" << DESKTOP
+[Desktop Entry]
+Name=VDI Client (RDP)
+Comment=VDI Remote Desktop session window
+Exec=/usr/bin/qf-client
+Icon=vdi-client
+Terminal=false
+Type=Application
+StartupWMClass=qf-client
 Categories=Network;RemoteAccess;
 DESKTOP
 

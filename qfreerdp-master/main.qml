@@ -124,10 +124,10 @@ Window {
 
         onContainsMouseChanged: {
             if (containsMouse) {
-                hideDelayTimer.stop()
-                toolbar.visible = true
-                toolbar.y = toolbar.shownY
+                // 悬停 1 秒后才显示工具栏，避免鼠标经过时误触发
+                showDelayTimer.restart()
             } else {
+                showDelayTimer.stop()
                 // 鼠标离开热区，启动隐藏定时器
                 hideDelayTimer.restart()
             }
@@ -319,6 +319,8 @@ Window {
         id: usbListModel
         function refresh() {
             clear()
+            // 挂载/卸载不会触发 USB 热插拔事件，开窗时顺带刷新一次挂载表
+            usbManager.refreshDiskState()
             var count = usbManager.deviceCount()
             for (var i = 0; i < count; i++) {
                 append({
@@ -326,7 +328,11 @@ Window {
                     label: usbManager.deviceLabel(i),
                     checked: usbManager.isDeviceSelected(i),
                     stateVal: usbManager.deviceState(i),
-                    errStr: usbManager.deviceError(i)
+                    errStr: usbManager.deviceError(i),
+                    // 已由磁盘重定向接管：不可勾选（无逃生开关）
+                    diskRedirected: usbManager.isDiskRedirected(i),
+                    mountPoints: usbManager.deviceMountPoints(i),
+                    composite: usbManager.isStorageComposite(i)
                 })
             }
         }
@@ -390,64 +396,101 @@ Window {
             ListView {
                 id: usbListView
                 width: parent.width
-                height: Math.min(260, usbListModel.count * 42)
+                height: Math.min(280, usbListModel.count * 46)
                 model: usbListModel
                 clip: true
                 visible: usbListModel.count > 0
 
                 delegate: Rectangle {
                     width: usbListView.width
-                    height: 38
+                    height: 44
                     color: itemMouse.containsMouse ? "#3a3a3a" : "transparent"
                     radius: 4
 
-                    Row {
+                    Column {
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.leftMargin: 4
                         anchors.verticalCenter: parent.verticalCenter
-                        spacing: 8
+                        spacing: 1
 
-                        Rectangle {
-                            anchors.verticalCenter: parent.verticalCenter
-                            width: 18; height: 18; radius: 3
-                            border.color: model.checked ? "#4CAF50" : "#888"
-                            border.width: 1
-                            color: model.checked ? "#4CAF50" : "transparent"
+                        Row {
+                            spacing: 8
 
-                            Text {
-                                anchors.centerIn: parent
-                                text: "✓"
-                                color: "white"
-                                font.pixelSize: 11
-                                visible: model.checked
-                            }
+                            // 已由磁盘重定向接管的设备置灰且不可勾选
+                            Rectangle {
+                                anchors.verticalCenter: parent.verticalCenter
+                                width: 18; height: 18; radius: 3
+                                border.color: model.diskRedirected ? "#555" :
+                                              model.checked ? "#4CAF50" : "#888"
+                                border.width: 1
+                                color: model.diskRedirected ? "#3a3a3a" :
+                                       model.checked ? "#4CAF50" : "transparent"
 
-                            MouseArea {
-                                anchors.fill: parent
-                                onClicked: {
-                                    var newVal = !model.checked
-                                    usbManager.setDeviceSelected(model.idx, newVal)
-                                    model.checked = newVal
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: "✓"
+                                    color: "#666"
+                                    font.pixelSize: 11
+                                    visible: model.checked && !model.diskRedirected
+                                }
+
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: "—"
+                                    color: "#666"
+                                    font.pixelSize: 11
+                                    visible: model.diskRedirected
+                                }
+
+                                MouseArea {
+                                    anchors.fill: parent
+                                    enabled: !model.diskRedirected
+                                    onClicked: {
+                                        var newVal = !model.checked
+                                        usbManager.setDeviceSelected(model.idx, newVal)
+                                        model.checked = newVal
+                                    }
                                 }
                             }
+
+                            Text {
+                                width: 270
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: model.label
+                                color: model.diskRedirected ? "#777" : "#e0e0e0"
+                                font.pixelSize: 12
+                                elide: Text.ElideRight
+                            }
+
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: model.stateVal === 0 ? "" :
+                                      model.stateVal === 1 ? "⟳" :
+                                      model.stateVal === 2 ? "✓" : "✗"
+                                color: model.stateVal === 2 ? "#4CAF50" :
+                                       model.stateVal === 3 ? "#F44336" : "#999"
+                                font.pixelSize: 13
+                                visible: model.stateVal !== 0
+                            }
                         }
 
+                        // 挂载点标注 / 复合设备提示
                         Text {
-                            text: model.label
-                            color: "#e0e0e0"
-                            font.pixelSize: 12
+                            leftPadding: 26
+                            width: parent.width
+                            text: model.diskRedirected
+                                  ? ("已磁盘重定向：" + model.mountPoints)
+                                  : (model.composite
+                                     ? (model.mountPoints !== ""
+                                        ? ("⚠ 含存储接口 · 已挂载：" + model.mountPoints)
+                                        : "⚠ 含存储接口")
+                                     : (model.mountPoints !== ""
+                                        ? ("已挂载：" + model.mountPoints) : ""))
+                            color: model.diskRedirected ? "#388E3C" : "#f0a020"
+                            font.pixelSize: 10
                             elide: Text.ElideRight
-                            width: 280
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-
-                        Text {
-                            anchors.verticalCenter: parent.verticalCenter
-                            text: model.stateVal === 0 ? "" :
-                                  model.stateVal === 1 ? "⟳" :
-                                  model.stateVal === 2 ? "✓" : "✗"
-                            color: model.stateVal === 2 ? "#4CAF50" :
-                                   model.stateVal === 3 ? "#F44336" : "#999"
-                            font.pixelSize: 13
-                            visible: model.stateVal !== 0
+                            visible: text !== ""
                         }
                     }
 
@@ -475,6 +518,8 @@ Window {
                         id: itemMouse
                         anchors.fill: parent
                         hoverEnabled: true
+                        // 置灰项不响应整行点击，避免误改选择
+                        enabled: !model.diskRedirected
                         onClicked: {
                             var newVal = !model.checked
                             usbManager.setDeviceSelected(model.idx, newVal)
@@ -555,6 +600,19 @@ Window {
                     }
                 }
             }
+        }
+    }
+
+    // ========== 延时显示定时器（热区悬停 1 秒后才显示工具栏） ==========
+    Timer {
+        id: showDelayTimer
+        interval: 1000
+        onTriggered: {
+            // 触发时鼠标仍在热区内才显示，防止已移开
+            if (!topHotZone.containsMouse) return
+            hideDelayTimer.stop()
+            toolbar.visible = true
+            toolbar.y = toolbar.shownY
         }
     }
 

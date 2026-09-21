@@ -42,6 +42,7 @@ extern void rdp_notify_mouse_moved(double qx, double qy);
 
 #include "qf_util.h"
 #include "qf_log.h"
+#include "kbd-shortcuts-inhibit.h"
 
 /* Forward declarations from mini-qf-client.cc */
 void start_rdp_connection();
@@ -185,6 +186,23 @@ public:
         connect(QGuiApplication::clipboard(), &QClipboard::dataChanged,
                 this, &RdpViewItem::dataChangedCallback);
 
+        /* 失去窗口激活（Alt+Tab 切走、最小化）时释放远端修饰键。
+         * Wayland 下切走期间的抬起事件收不到，否则远端会一直卡着 Alt/Win。 */
+        connect(this, &QQuickItem::windowChanged, this, [this](QQuickWindow* w) {
+            if (m_windowActiveConn)
+                QObject::disconnect(m_windowActiveConn);
+            if (w) {
+                m_windowActiveConn = connect(w, &QQuickWindow::activeChanged, this, [this] {
+                    if (!window() || !window()->isActive()) {
+                        releaseAllRemoteModifiers();
+                        m_inhibitSuspended = false;   /* 重新获得焦点后恢复抑制 */
+                    }
+                    updateShortcutInhibit();
+                });
+            }
+            updateShortcutInhibit();
+        });
+
         qf::log::info("view/init", "RdpViewItem created");
     }
     bool isFullscreen() const { return m_fullscreen; }
@@ -263,7 +281,9 @@ public:
     /* Called from FreeRDP thread when the connection drops. */
     Q_INVOKABLE void notifyDisconnected()
     {
+        releaseAllRemoteModifiers();
         m_rdpContext = nullptr;
+        updateShortcutInhibit();
         m_qfClientContext.reset();
         QCoreApplication::quit();
     }
@@ -271,6 +291,8 @@ public:
     void setFreeRDP_context(rdpContext* context)
     {
         m_rdpContext = context;
+        /* 由 RDP 线程调用，抑制请求必须回到 GUI 线程执行 */
+        QMetaObject::invokeMethod(this, [this] { updateShortcutInhibit(); }, Qt::QueuedConnection);
     }
 
     void set_qfclient_context(std::shared_ptr<qf::client_t> context)
@@ -657,24 +679,47 @@ public:
                           freerdp_mouse_event, map_x, map_y);
     }
 
+    /* Qt 鼠标键 → RDP 指针标志。中键对应 PTR_FLAGS_BUTTON3，不是 BUTTON2 */
+    static uint16_t mouseButtonToPtrFlags(Qt::MouseButton button) {
+        switch (button) {
+        case Qt::LeftButton:   return PTR_FLAGS_BUTTON1;
+        case Qt::MiddleButton: return PTR_FLAGS_BUTTON3;
+        case Qt::RightButton:  return PTR_FLAGS_BUTTON2;
+        default:               return 0;
+        }
+    }
+
+    /* 多个键同时按住（拖拽过程中的移动事件）时按位合并 */
+    static uint16_t mouseButtonsToPtrFlags(Qt::MouseButtons buttons) {
+        uint16_t flags = 0;
+        if (buttons & Qt::LeftButton)   flags |= PTR_FLAGS_BUTTON1;
+        if (buttons & Qt::MiddleButton) flags |= PTR_FLAGS_BUTTON3;
+        if (buttons & Qt::RightButton)  flags |= PTR_FLAGS_BUTTON2;
+        return flags;
+    }
+
     void mousePressEvent(QMouseEvent* event) override {
-        uint16_t flags = (event->button() == Qt::LeftButton) ? PTR_FLAGS_BUTTON1 | PTR_FLAGS_DOWN : PTR_FLAGS_BUTTON2 | PTR_FLAGS_DOWN;
-        mouseEventScaleSend(event->position().x(), event->position().y(), flags);
+        mouseEventScaleSend(event->position().x(), event->position().y(),
+                            mouseButtonToPtrFlags(event->button()) | PTR_FLAGS_DOWN);
         event->accept();
     }
     void mouseReleaseEvent(QMouseEvent* event) override {
-        uint16_t flags = (event->button() == Qt::LeftButton) ? PTR_FLAGS_BUTTON1 : PTR_FLAGS_BUTTON2;
-        mouseEventScaleSend(event->position().x(), event->position().y(), flags);
+        mouseEventScaleSend(event->position().x(), event->position().y(),
+                            mouseButtonToPtrFlags(event->button()));
         event->accept();
     }
     void mouseMoveEvent(QMouseEvent* event) override {
         rdp_notify_mouse_moved(event->position().x(), event->position().y());
-        mouseEventScaleSend(event->position().x(), event->position().y(), PTR_FLAGS_MOVE);
+        /* move 事件里 event->button() 恒为 NoButton，拖拽中的键必须从 buttons() 取 */
+        mouseEventScaleSend(event->position().x(), event->position().y(),
+                            PTR_FLAGS_MOVE | mouseButtonsToPtrFlags(event->buttons()));
         event->accept();
     }
     void hoverMoveEvent(QHoverEvent* event) override {
         rdp_notify_mouse_moved(event->position().x(), event->position().y());
-        mouseEventScaleSend(event->position().x(), event->position().y(), PTR_FLAGS_MOVE);
+        mouseEventScaleSend(event->position().x(), event->position().y(),
+                            PTR_FLAGS_MOVE |
+                                mouseButtonsToPtrFlags(QGuiApplication::mouseButtons()));
         event->accept();
     }
     void wheelEvent(QWheelEvent* event) override {
@@ -686,8 +731,127 @@ public:
         event->accept();
     }
 
+    /* =====================================================================
+     * 修饰键重建 (P0)
+     * Wayland 下合成器会吞掉 Super 的按下事件（GNOME/KDE 都是如此），也会吞掉
+     * Alt+Tab 这类组合键的抬起事件，结果就是：远端收不到 Win 组合键，或者修饰
+     * 键卡住不放。这里以 QKeyEvent::modifiers() 为准，与远端修饰键状态对齐：
+     *   - modifiers() 里有、远端却没按下 → 补发按下（Win+R/E/D/A 就是这么来的）
+     *   - modifiers() 里没有、远端却按着 → 补发抬起（抬起事件被吞时救回来）
+     * 修饰键自身的物理事件仍按原路径转发，靠 m_remoteModDown 避免重复发送。
+     * ===================================================================== */
+    static int modifierIndexForQtKey(int qkey)
+    {
+        switch (qkey) {
+            case Qt::Key_Shift:   return ModShift;
+            case Qt::Key_Control: return ModCtrl;
+            case Qt::Key_Alt:     return ModAlt;
+            case Qt::Key_Meta:    return ModMeta;
+            default:              return -1;
+        }
+    }
+
+    static Qt::KeyboardModifier modifierFlagForIndex(int idx)
+    {
+        switch (idx) {
+            case ModShift: return Qt::ShiftModifier;
+            case ModCtrl:  return Qt::ControlModifier;
+            case ModAlt:   return Qt::AltModifier;
+            default:       return Qt::MetaModifier;
+        }
+    }
+
+    static UINT32 modifierScancodeForIndex(int idx)
+    {
+        switch (idx) {
+            case ModShift: return RDP_SCANCODE_LSHIFT;
+            case ModCtrl:  return RDP_SCANCODE_LCONTROL;
+            case ModAlt:   return RDP_SCANCODE_LMENU;
+            default:       return RDP_SCANCODE_LWIN;
+        }
+    }
+
+    static const char* modifierNameForIndex(int idx)
+    {
+        switch (idx) {
+            case ModShift: return "LSHIFT";
+            case ModCtrl:  return "LCONTROL";
+            case ModAlt:   return "LMENU";
+            default:       return "LWIN";
+        }
+    }
+
+    void sendModifierKey(int idx, bool down)
+    {
+        if (!m_rdpContext || !m_rdpContext->input) return;
+        freerdp_input_send_keyboard_event_ex(m_rdpContext->input, down ? TRUE : FALSE,
+                                             FALSE, modifierScancodeForIndex(idx));
+        m_remoteModDown[idx] = down;
+    }
+
+    /* 普通按键到达时，按 modifiers() 对齐远端修饰键状态 */
+    void syncRemoteModifiers(Qt::KeyboardModifiers modifiers)
+    {
+        for (int i = 0; i < ModCount; ++i) {
+            const bool want = modifiers.testFlag(modifierFlagForIndex(i));
+            if (want == m_remoteModDown[i]) continue;
+            sendModifierKey(i, want);
+            qf::log::info("input/kbd", "{} {} (modifiers=0x{:x})",
+                          want ? "synthesize down" : "synthesize up",
+                          modifierNameForIndex(i), static_cast<uint32_t>(modifiers));
+        }
+    }
+
+    /* 释放远端所有仍按下的修饰键（失焦、断开连接时调用） */
+    void releaseAllRemoteModifiers()
+    {
+        if (!m_rdpContext || !m_rdpContext->input) {
+            for (int i = 0; i < ModCount; ++i) m_remoteModDown[i] = false;
+            return;
+        }
+        for (int i = 0; i < ModCount; ++i) {
+            if (!m_remoteModDown[i]) continue;
+            sendModifierKey(i, false);
+            qf::log::info("input/kbd", "release {}", modifierNameForIndex(i));
+        }
+    }
+
+    /* =====================================================================
+     * 合成器快捷键抑制 (P1)
+     * Wayland 下 GNOME/KDE 在合成器层就吃掉了 Super 组合键（Super+A/N/S…），
+     * 按键根本到不了客户端，P0 的修饰键重建也就无从下手。这里通过
+     * zwp_keyboard_shortcuts_inhibit_v1 请合成器把前台窗口的快捷键让给客户端
+     * （对齐 FreeRDP 官方 wlfreerdp：聚焦时抑制，按右 Ctrl 释放）。
+     * ===================================================================== */
+    void updateShortcutInhibit()
+    {
+        QQuickWindow* w = window();
+        const bool want = m_rdpContext && w && w->isActive() && !m_inhibitSuspended;
+        if (want == m_inhibitRequested)
+            return;
+        m_inhibitRequested = want;
+        qf::kbd::setShortcutsInhibited(w, want);
+    }
+
+    /* Qt 的 key() 区分不了左右 Ctrl，只能看原生信息：
+     *   - nativeVirtualKey() 是 keysym，右 Ctrl = XK_Control_R = 0xffe4
+     *   - nativeScanCode() 是 xkb/X11 keycode，右 Ctrl = 105（左 Ctrl = 37）
+     * 两者都带 key()==Key_Control 前置条件，不会把别的键误判成右 Ctrl。 */
+    static bool isRightControl(const QKeyEvent* event)
+    {
+        return event->key() == Qt::Key_Control
+               && (event->nativeVirtualKey() == 0xffe4 || event->nativeScanCode() == 105);
+    }
+
     void keyboardUnicodeEventSend(QKeyEvent* event, bool down) {
         if (!m_rdpContext) return;
+
+        const int modIdx = modifierIndexForQtKey(event->key());
+        if (modIdx >= 0)
+            m_remoteModDown[modIdx] = down;    /* 物理修饰键：状态跟随事件 */
+        else
+            syncRemoteModifiers(event->modifiers());   /* 普通键：先对齐修饰键 */
+
         UINT32 freerdp_key_code = qf::to_freerdp_key_code(event);
         if (freerdp_key_code == RDP_SCANCODE_UNKNOWN) {
             uint16_t flags = down ? 0 : KBD_FLAGS_RELEASE;
@@ -695,11 +859,29 @@ public:
                 freerdp_input_send_unicode_keyboard_event(m_rdpContext->input, flags, event->text().unicode()->unicode());
             return;
         }
+        /* Pause 在 RDP 里是一串按键序列而非单个扫描码，FreeRDP 提供了专用接口；
+         * 仅未按 Ctrl 时适用（Ctrl+Pause 即 Break，按普通扩展键发送）。
+         * 与 FreeRDP 官方 X11 客户端处理一致：只在按下时发一次，抬起不发。 */
+        if (freerdp_key_code == RDP_SCANCODE_PAUSE && !m_remoteModDown[ModCtrl]) {
+            if (down)
+                freerdp_input_send_keyboard_pause_event(m_rdpContext->input);
+            return;
+        }
         freerdp_input_send_keyboard_event_ex(m_rdpContext->input, down,
                                              down && event->isAutoRepeat(), freerdp_key_code);
     }
 
-    void keyPressEvent(QKeyEvent* event) override { keyboardUnicodeEventSend(event, true); event->accept(); }
+    void keyPressEvent(QKeyEvent* event) override
+    {
+        /* 右 Ctrl 释放快捷键抑制，便于切回本地桌面；重新聚焦时自动恢复 */
+        if (!m_inhibitSuspended && isRightControl(event)) {
+            m_inhibitSuspended = true;
+            updateShortcutInhibit();
+            qf::log::info("input/kbd", "右 Ctrl：释放合成器快捷键抑制");
+        }
+        keyboardUnicodeEventSend(event, true);
+        event->accept();
+    }
     void keyReleaseEvent(QKeyEvent* event) override { keyboardUnicodeEventSend(event, false); event->accept(); }
 
     /* Send Ctrl+Alt+Delete to the RDP server (from toolbar button). */
@@ -855,6 +1037,15 @@ signals:
     void fullscreenChanged();
 
 private:
+    /* 修饰键重建状态：远端当前是否按着 Shift/Ctrl/Alt/Win（见 syncRemoteModifiers） */
+    enum ModIndex { ModShift = 0, ModCtrl, ModAlt, ModMeta, ModCount };
+    bool                      m_remoteModDown[ModCount] = { false, false, false, false };
+    QMetaObject::Connection   m_windowActiveConn;
+
+    /* 合成器快捷键抑制状态（见 updateShortcutInhibit） */
+    bool                      m_inhibitRequested = false;   /* 是否已请求抑制 */
+    bool                      m_inhibitSuspended = false;   /* 右 Ctrl 临时释放，聚焦后复位 */
+
     /* Frame buffer — CPU-side copy of the decoded frame, uploaded to GL texture */
     std::vector<uint8_t> m_frameBuffer;
     uint32_t             m_frameWidth  = 0;

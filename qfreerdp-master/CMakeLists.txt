@@ -14,7 +14,7 @@ set(CMAKE_AUTORCC ON)
 list(PREPEND CMAKE_PREFIX_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../freerdp-3.28.0/install")
 
 # 1. 寻找 Qt 6 的核心与 QML 相关模块
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Qml Quick)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Qml Quick DBus)
 find_package(FreeRDP 3 REQUIRED)
 find_package(WinPR 3 REQUIRED)
 find_package(FreeRDP-Client 3 REQUIRED)
@@ -25,6 +25,8 @@ message(STATUS "FreeRDP_VERSION: ${FreeRDP_VERSION}")
 qt_add_executable(qf-client
     mini-qf-client.cc
     usb-manager.cc
+    kbd-shortcuts-inhibit.cc
+    protocols/keyboard-shortcuts-inhibit-unstable-v1-protocol.c
     qf_channel_client_handler.c
     ${CLIPRDR_REF_DIR}/cliprdr_main.c
     ${CLIPRDR_REF_DIR}/cliprdr_format.c
@@ -94,12 +96,28 @@ if(PkgConfig_FOUND)
     endif()
 endif()
 
+# 9. libwayland-client for zwp_keyboard_shortcuts_inhibit_v1（Wayland 下抑制合成器快捷键）
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(WAYLAND_CLIENT wayland-client)
+    if(WAYLAND_CLIENT_FOUND)
+        target_include_directories(qf-client PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
+        target_link_libraries(qf-client PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+        message(STATUS "wayland-client found: ${WAYLAND_CLIENT_LIBRARIES}")
+    else()
+        message(WARNING "wayland-client not found — 合成器快捷键抑制不可用")
+    endif()
+endif()
+
 # 8. Link Qt modules (must be last to satisfy linker ordering)
+# Qt6::GuiPrivate 提供 qpa/qplatformnativeinterface.h（取自 wl_surface/wl_display）
 target_link_libraries(qf-client PRIVATE
     Qt6::Core
     Qt6::Gui
+    Qt6::GuiPrivate
     Qt6::Qml
     Qt6::Quick
+    Qt6::DBus
     freerdp
     freerdp-client
     winpr

@@ -173,6 +173,28 @@ static BOOL cam_v4l_deactivate(ICamHal* ihal, const char* deviceId, CAM_ERROR_CO
 }
 
 /**
+ * @brief 判断某个 (width,height,fps) 是否已经在清单中出现过
+ *
+ * 不同采集格式可能提供完全相同的尺寸+帧率组合（如 YUYV 与 MJPG 都有 640x360@30），
+ * 而条目发给服务端前 Format 会被统一改写为 outputFormat，重复条目在服务端无法区分。
+ *
+ * @return TRUE 表示重复，应丢弃
+ */
+static BOOL cam_v4l_media_type_duplicate(const CAM_MEDIA_TYPE_DESCRIPTION* types, size_t count,
+                                        const CAM_MEDIA_TYPE_DESCRIPTION* candidate)
+{
+	for (size_t i = 0; i < count; i++)
+	{
+		if ((types[i].Width == candidate->Width) && (types[i].Height == candidate->Height) &&
+		    (types[i].FrameRateNumerator == candidate->FrameRateNumerator) &&
+		    (types[i].FrameRateDenominator == candidate->FrameRateDenominator))
+			return TRUE;
+	}
+
+	return FALSE;
+}
+
+/**
  * Function description
  *
  * @return -1 if error, otherwise index of supportedFormats array and mediaTypes/nMediaTypes filled
@@ -188,7 +210,12 @@ static INT16 cam_v4l_get_media_type_descriptions(ICamHal* ihal, const char* devi
 	CamV4lHal* hal = (CamV4lHal*)ihal;
 	size_t maxMediaTypes = *nMediaTypes;
 	size_t nTypes = 0;
-	BOOL formatFound = FALSE;
+	/* 已写出的条目首地址，用于按 (width,height,fps) 去重 */
+	CAM_MEDIA_TYPE_DESCRIPTION* const firstType = mediaTypes;
+	INT16 firstMatchedIndex = -1;
+	/* 同一个输入格式在候选表里会与多个输出格式配对出现，只枚举其首次出现的那组
+	 * （候选表按输出格式分组，首次配对即为 →H264） */
+	BOOL seenFormat[CAM_MEDIA_FORMAT_RGB32 + 1] = WINPR_C_ARRAY_INIT;
 
 	CamV4lStream* stream = (CamV4lStream*)HashTable_GetItemValue(hal->streams, deviceId);
 
@@ -214,10 +241,14 @@ static INT16 cam_v4l_get_media_type_descriptions(ICamHal* ihal, const char* devi
 
 	(void)0; /* placeholder for future format enumeration */
 
-	size_t formatIndex = 0;
-	for (; formatIndex < nSupportedFormats; formatIndex++)
+	for (size_t formatIndex = 0; formatIndex < nSupportedFormats; formatIndex++)
 	{
-		const UINT32 pixelFormat = ecamToV4L2PixFormat(supportedFormats[formatIndex].inputFormat);
+		const CAM_MEDIA_FORMAT inputFormat = supportedFormats[formatIndex].inputFormat;
+
+		if (((size_t)inputFormat) > CAM_MEDIA_FORMAT_RGB32 || seenFormat[inputFormat])
+			continue;
+
+		const UINT32 pixelFormat = ecamToV4L2PixFormat(inputFormat);
 
 		WINPR_ASSERT(pixelFormat != 0);
 		struct v4l2_frmsizeenum frmsize = WINPR_C_ARRAY_INIT;
@@ -225,18 +256,22 @@ static INT16 cam_v4l_get_media_type_descriptions(ICamHal* ihal, const char* devi
 		if (!cam_v4l_format_supported(fd, pixelFormat))
 			continue;
 
+		if (firstMatchedIndex < 0)
+			firstMatchedIndex = WINPR_ASSERTING_INT_CAST(INT16, formatIndex);
+		seenFormat[inputFormat] = TRUE;
+
 		frmsize.pixel_format = pixelFormat;
 		for (frmsize.index = 0; ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) == 0; frmsize.index++)
 		{
+			CAM_MEDIA_TYPE_DESCRIPTION desc = WINPR_C_ARRAY_INIT;
 			struct v4l2_frmivalenum frmival = WINPR_C_ARRAY_INIT;
 
 			if (frmsize.type != V4L2_FRMSIZE_TYPE_DISCRETE)
 				break; /* don't support size types other than discrete */
 
-			formatFound = TRUE;
-			mediaTypes->Width = frmsize.discrete.width;
-			mediaTypes->Height = frmsize.discrete.height;
-			mediaTypes->Format = supportedFormats[formatIndex].inputFormat;
+			desc.Format = inputFormat;
+			desc.Width = frmsize.discrete.width;
+			desc.Height = frmsize.discrete.height;
 
 			/* query frame rate (1st is highest fps supported) */
 			frmival.index = 0;
@@ -247,24 +282,28 @@ static INT16 cam_v4l_get_media_type_descriptions(ICamHal* ihal, const char* devi
 			    frmival.type == V4L2_FRMIVAL_TYPE_DISCRETE)
 			{
 				/* inverse of a fraction */
-				mediaTypes->FrameRateNumerator = frmival.discrete.denominator;
-				mediaTypes->FrameRateDenominator = frmival.discrete.numerator;
+				desc.FrameRateNumerator = frmival.discrete.denominator;
+				desc.FrameRateDenominator = frmival.discrete.numerator;
 			}
 			else
 			{
 				WLog_DBG(TAG, "VIDIOC_ENUM_FRAMEINTERVALS failed, using default framerate");
-				mediaTypes->FrameRateNumerator = CAM_V4L2_FRAMERATE_NUMERATOR_DEFAULT;
-				mediaTypes->FrameRateDenominator = CAM_V4L2_FRAMERATE_DENOMINATOR_DEFAULT;
+				desc.FrameRateNumerator = CAM_V4L2_FRAMERATE_NUMERATOR_DEFAULT;
+				desc.FrameRateDenominator = CAM_V4L2_FRAMERATE_DENOMINATOR_DEFAULT;
 			}
 
-			mediaTypes->PixelAspectRatioNumerator = mediaTypes->PixelAspectRatioDenominator = 1;
+			desc.PixelAspectRatioNumerator = desc.PixelAspectRatioDenominator = 1;
 
 			char fourccstr[5] = WINPR_C_ARRAY_INIT;
 			WLog_DBG(TAG, "Camera format: %s, width: %u, height: %u, fps: %u/%u",
 			         cam_v4l_get_fourcc_str(pixelFormat, fourccstr, ARRAYSIZE(fourccstr)),
-			         mediaTypes->Width, mediaTypes->Height, mediaTypes->FrameRateNumerator,
-			         mediaTypes->FrameRateDenominator);
+			         desc.Width, desc.Height, desc.FrameRateNumerator, desc.FrameRateDenominator);
 
+			/* 同一 (width,height,fps) 只保留先出现的那个：候选表里带宽更低的格式排在前面 */
+			if (cam_v4l_media_type_duplicate(firstType, nTypes, &desc))
+				continue;
+
+			*mediaTypes = desc;
 			mediaTypes++;
 			nTypes++;
 
@@ -274,21 +313,13 @@ static INT16 cam_v4l_get_media_type_descriptions(ICamHal* ihal, const char* devi
 				goto error;
 			}
 		}
-
-		if (formatFound)
-		{
-			/* we are interested in 1st supported format only, with all supported sizes */
-			break;
-		}
 	}
 
 error:
 
 	*nMediaTypes = nTypes;
 	close(fd);
-	if (formatIndex > INT16_MAX)
-		return -1;
-	return (INT16)formatIndex;
+	return firstMatchedIndex;
 }
 
 /**

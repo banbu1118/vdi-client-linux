@@ -51,6 +51,8 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <dirent.h>
+#include <unistd.h>
 #endif
 
 #ifdef __MACOSX__
@@ -727,6 +729,94 @@ static DWORD WINAPI drive_hotplug_thread_func(LPVOID arg)
 
 #else
 
+#if defined(__LINUX__) || defined(__linux__)
+/* Linux 下"哪些目录算盘"的判定。
+ *
+ * 送进虚拟机的集合（与 Windows 版对齐）：当前登录用户的 home 目录、网络存储（NAS）、
+ * U盘/移动硬盘等可移动介质。系统分区（/、/boot、/usr 等）不重定向 —— 把整个根文件
+ * 系统搬进虚拟机既危险也没有意义。
+ *
+ * 旧实现是按挂载点前缀白名单（automountLocations）匹配，问题：
+ *   - gvfsd-fuse 挂在 /run/user/<uid>/gvfs 的空目录恰好命中白名单第一条，
+ *     VM 里凭空多出一个看不见文件、也拷不进去的 "gvfs" 盘符；
+ *   - 反过来挂在 / 的内置盘永远进不去。 */
+
+/* U盘/移动硬盘等可移动介质的挂载根（udisks 默认挂到 /media/<user> 或 /run/media/<user>） */
+static const char* userStorageRoots[] = { "/media", "/run/media", "/mnt" };
+
+/* NAS 的网络文件系统类型 */
+static const char* networkFsTypes[] = { "nfs",    "nfs2",       "nfs3",       "nfs4",      "cifs",
+	                                    "smbfs",  "sshfs",      "fuse.sshfs", "davfs",     "fuse.davfs",
+	                                    "9p" };
+
+static BOOL is_block_device_source(const char* source)
+{
+	if (!source || strncmp(source, "/dev/", 5) != 0)
+		return FALSE;
+	/* cliprdr 等 FUSE 通道的临时挂载，源是 /dev/fuse 而不是分区 */
+	if (strcmp(source, "/dev/fuse") == 0)
+		return FALSE;
+	/* snap / squashfs 等只读镜像，不是用户可用的磁盘 */
+	if (strncmp(source, "/dev/loop", 9) == 0)
+		return FALSE;
+	return TRUE;
+}
+
+static BOOL is_user_storage_path(const char* path)
+{
+	if (!path)
+		return FALSE;
+
+	for (size_t x = 0; x < ARRAYSIZE(userStorageRoots); x++)
+	{
+		const char* root = userStorageRoots[x];
+		const size_t length = strlen(root);
+
+		if (strncmp(root, path, length) != 0)
+			continue;
+		if ((path[length] == '\0') || (path[length] == '/'))
+			return TRUE;
+	}
+	return FALSE;
+}
+
+static BOOL is_network_fs(const char* fstype)
+{
+	if (!fstype)
+		return FALSE;
+
+	for (size_t x = 0; x < ARRAYSIZE(networkFsTypes); x++)
+	{
+		if (strcmp(fstype, networkFsTypes[x]) == 0)
+			return TRUE;
+	}
+	return FALSE;
+}
+
+/* 当前用户读不到的挂载点（如 root 专属的 /boot/efi）重定向过去只是个打不开的盘符 */
+static BOOL is_readable_path(const char* path)
+{
+	return path && (access(path, R_OK) == 0);
+}
+
+static BOOL is_redirectable_mount(const char* source, const char* fstype, const char* mountpoint)
+{
+	if (!is_readable_path(mountpoint))
+		return FALSE;
+
+	/* NAS：网络文件系统挂在哪都算 */
+	if (is_network_fs(fstype))
+		return TRUE;
+
+	/* U盘/移动硬盘：块设备且落在用户存储根下 */
+	if (!is_block_device_source(source))
+		return FALSE;
+	return is_user_storage_path(mountpoint);
+}
+#endif
+
+#if !defined(__LINUX__) && !defined(__linux__)
+/* Sun/BSD 维持原来的挂载点前缀白名单 */
 static const char* automountLocations[] = { "/run/user/%lu/gvfs", "/run/media/%s", "/media/%s",
 	                                        "/media", "/mnt" };
 
@@ -781,6 +871,7 @@ static BOOL isAutomountLocation(const char* path)
 
 	return FALSE;
 }
+#endif
 
 #define MAX_USB_DEVICES 100
 
@@ -790,17 +881,32 @@ typedef struct
 	BOOL to_add;
 } hotplug_dev;
 
-static void handle_mountpoint(hotplug_dev* dev_array, size_t* size, const char* mountpoint)
+static void add_hotplug_dev(hotplug_dev* dev_array, size_t* size, const char* path)
+{
+	if (!path || (*size >= MAX_USB_DEVICES))
+		return;
+
+	dev_array[*size].path = _strdup(path);
+	dev_array[*size].to_add = TRUE;
+	(*size)++;
+}
+
+static void handle_mountpoint(hotplug_dev* dev_array, size_t* size, const char* source,
+                              const char* fstype, const char* mountpoint)
 {
 	if (!mountpoint)
 		return;
+
 	/* copy hotpluged device mount point to the dev_array */
-	if (isAutomountLocation(mountpoint) && (*size < MAX_USB_DEVICES))
-	{
-		dev_array[*size].path = _strdup(mountpoint);
-		dev_array[*size].to_add = TRUE;
-		(*size)++;
-	}
+#if defined(__LINUX__) || defined(__linux__)
+	const BOOL redirectable = is_redirectable_mount(source, fstype, mountpoint);
+#else
+	const BOOL redirectable = isAutomountLocation(mountpoint);
+	WINPR_UNUSED(source);
+	WINPR_UNUSED(fstype);
+#endif
+	if (redirectable)
+		add_hotplug_dev(dev_array, size, mountpoint);
 }
 
 #ifdef __sun
@@ -817,7 +923,7 @@ static UINT handle_platform_mounts_sun(wLog* log, hotplug_dev* dev_array, size_t
 	}
 	while (getmntent(f, &ent) == 0)
 	{
-		handle_mountpoint(dev_array, size, ent.mnt_mountp);
+		handle_mountpoint(dev_array, size, ent.mnt_special, ent.mnt_type, ent.mnt_mountp);
 	}
 	fclose(f);
 	return ERROR_SUCCESS;
@@ -840,7 +946,8 @@ static UINT handle_platform_mounts_bsd(wLog* log, hotplug_dev* dev_array, size_t
 	}
 	for (size_t idx = 0; idx < (size_t)mntsize; idx++)
 	{
-		handle_mountpoint(dev_array, size, mntbuf[idx].f_mntonname);
+		handle_mountpoint(dev_array, size, mntbuf[idx].f_mntfromname, mntbuf[idx].f_fstypename,
+		                  mntbuf[idx].f_mntonname);
 	}
 	free(mntbuf);
 	return ERROR_SUCCESS;
@@ -869,6 +976,14 @@ static UINT handle_platform_mounts_linux(wLog* log, hotplug_dev* dev_array, size
 	struct mntent mnt = WINPR_C_ARRAY_INIT;
 	char pathbuffer[PATH_MAX] = WINPR_C_ARRAY_INIT;
 	struct mntent* ent = nullptr;
+
+	/* 1. 当前用户的 home 目录。它通常就是根文件系统上的一个普通目录，
+	 *    /proc/mounts 里看不到，必须单独加。 */
+	const char* home = getenv("HOME");
+	if (home && (strcmp(home, "/") != 0) && is_readable_path(home))
+		add_hotplug_dev(dev_array, size, home);
+
+	/* 2. /proc/mounts：NAS 与用户存储根下的可移动介质 */
 	f = winpr_fopen("/proc/mounts", "r");
 	if (f == nullptr)
 	{
@@ -877,9 +992,34 @@ static UINT handle_platform_mounts_linux(wLog* log, hotplug_dev* dev_array, size
 	}
 	while ((ent = getmntent_x(f, &mnt, pathbuffer, sizeof(pathbuffer))) != nullptr)
 	{
-		handle_mountpoint(dev_array, size, ent->mnt_dir);
+		handle_mountpoint(dev_array, size, ent->mnt_fsname, ent->mnt_type, ent->mnt_dir);
 	}
 	(void)fclose(f);
+
+	/* 3. gvfs 子挂载：GNOME 文件管理器访问 smb:// 之类的地址时会挂到这里。
+	 *    根目录本身只是个空的容器目录（既看不到文件也写不进去），
+	 *    所以只取它下面真实存在的挂载点。 */
+	char gvfsdir[PATH_MAX] = WINPR_C_ARRAY_INIT;
+	(void)snprintf(gvfsdir, sizeof(gvfsdir), "/run/user/%lu/gvfs", (unsigned long)getuid());
+
+	DIR* dir = opendir(gvfsdir);
+	if (dir)
+	{
+		struct dirent* de = nullptr;
+		while ((de = readdir(dir)) != nullptr)
+		{
+			if ((de->d_name[0] == '\0') || (strcmp(de->d_name, ".") == 0) ||
+			    (strcmp(de->d_name, "..") == 0))
+				continue;
+
+			char path[PATH_MAX] = WINPR_C_ARRAY_INIT;
+			(void)snprintf(path, sizeof(path), "%s/%s", gvfsdir, de->d_name);
+			if (is_readable_path(path))
+				add_hotplug_dev(dev_array, size, path);
+		}
+		(void)closedir(dir);
+	}
+
 	return ERROR_SUCCESS;
 }
 #endif
@@ -961,18 +1101,16 @@ static BOOL hotplug_delete_foreach(ULONG_PTR key, void* element, void* data)
 	if (!path)
 		return FALSE;
 
-	/* not pluggable device */
-	if (isAutomountLocation(path))
+	/* 热插拔机制注册的设备：当前快照里若还有完全相同的路径就保留，
+	 * 同时把该条目标成"已存在"，避免下面重复注册 */
+	for (size_t i = 0; i < arg->dev_array_size; i++)
 	{
-		for (size_t i = 0; i < arg->dev_array_size; i++)
+		hotplug_dev* cur = &arg->dev_array[i];
+		if (cur->path && (strcmp(cur->path, path) == 0))
 		{
-			hotplug_dev* cur = &arg->dev_array[i];
-			if (cur->path && strstr(path, cur->path) != nullptr)
-			{
-				dev_found = TRUE;
-				cur->to_add = FALSE;
-				break;
-			}
+			dev_found = TRUE;
+			cur->to_add = FALSE;
+			break;
 		}
 	}
 
@@ -996,6 +1134,34 @@ static BOOL hotplug_delete_foreach(ULONG_PTR key, void* element, void* data)
 
 	return TRUE;
 }
+
+#if defined(__LINUX__) || defined(__linux__)
+/* 生成 VM 内的盘名：普通挂载点取末段（/media/kk/UDISK -> UDISK）；
+ * gvfs 的挂载目录名形如 "smb-share:server=nas,share=data"，又长又含 ':' ','，
+ * 取第一个 key=value 的 value（server=nas -> nas）更可读。 */
+static void hotplug_drive_name(const char* path, char* buffer, size_t size)
+{
+	const char* base = strrchr(path, '/');
+	base = base ? (base + 1) : path;
+
+	const char* colon = strchr(base, ':');
+	const char* eq = colon ? strchr(colon + 1, '=') : nullptr;
+	if (eq)
+	{
+		const char* start = eq + 1;
+		const char* end = strchr(start, ',');
+		const size_t length = end ? (size_t)(end - start) : strlen(start);
+
+		if ((length > 0) && (length < size))
+		{
+			(void)snprintf(buffer, size, "%.*s", (int)length, start);
+			return;
+		}
+	}
+
+	(void)snprintf(buffer, size, "%s", (*base != '\0') ? base : "rootfs");
+}
+#endif
 
 static UINT handle_hotplug(RdpdrClientContext* context,
                            WINPR_ATTR_UNUSED RdpdrHotplugEventType type)
@@ -1024,6 +1190,11 @@ static UINT handle_hotplug(RdpdrClientContext* context,
 		{
 			const char* path = cur->path;
 			const char* name = strrchr(path, '/') + 1;
+#if defined(__LINUX__) || defined(__linux__)
+			char namebuffer[MAX_PATH] = WINPR_C_ARRAY_INIT;
+			hotplug_drive_name(path, namebuffer, sizeof(namebuffer));
+			name = namebuffer;
+#endif
 
 			rdpdr_load_drive(rdpdr, name, path, TRUE);
 			error = ERROR_DISK_CHANGE;

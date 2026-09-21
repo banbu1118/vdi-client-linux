@@ -14,31 +14,51 @@ class RdpViewItem;
 
 namespace qf {
 
+/* FreeRDP 3.28 的 scancode.h 未提供 Menu/Application 键（VK_APPS）常量，此处补一个 */
+static constexpr UINT32 RDP_SCANCODE_APPLICATION = MAKE_RDP_SCANCODE(0x5D, TRUE);
+
 inline UINT to_freerdp_key_code(const QKeyEvent* event)
 {
     const int qkey = event->key();
-    const bool keypad = event->modifiers() & Qt::KeypadModifier;
 
-    if (keypad) {
-        switch (qkey) {
-            case Qt::Key_0: return RDP_SCANCODE_NUMPAD0;
-            case Qt::Key_1: return RDP_SCANCODE_NUMPAD1;
-            case Qt::Key_2: return RDP_SCANCODE_NUMPAD2;
-            case Qt::Key_3: return RDP_SCANCODE_NUMPAD3;
-            case Qt::Key_4: return RDP_SCANCODE_NUMPAD4;
-            case Qt::Key_5: return RDP_SCANCODE_NUMPAD5;
-            case Qt::Key_6: return RDP_SCANCODE_NUMPAD6;
-            case Qt::Key_7: return RDP_SCANCODE_NUMPAD7;
-            case Qt::Key_8: return RDP_SCANCODE_NUMPAD8;
-            case Qt::Key_9: return RDP_SCANCODE_NUMPAD9;
-            case Qt::Key_Plus: return RDP_SCANCODE_ADD;
-            case Qt::Key_Minus: return RDP_SCANCODE_SUBTRACT;
-            case Qt::Key_Asterisk: return RDP_SCANCODE_MULTIPLY;
-            case Qt::Key_Slash: return RDP_SCANCODE_DIVIDE;
-            case Qt::Key_Period: return RDP_SCANCODE_DECIMAL;
-            case Qt::Key_Enter: return RDP_SCANCODE_RETURN_KP;
-            default: break;
-        }
+    /* 小键盘按键按 keysym 判定，不依赖 NumLock 状态。
+     * NumLock 关闭时 Qt 把小键盘数字上报成方向键（keysym 变成 KP_Left 之类），
+     * 只看 key() 就会当成普通方向键、发出带扩展位的扫描码，远端永远只当方向键用；
+     * 而本地和远端的 NumLock 各自独立翻转、相位差固定，按 NumLock 也对不上。
+     * 官方 X11 客户端（xf_keyboard.c）同样无条件映射到小键盘扫描码，由远端
+     * NumLock 决定输出数字还是方向键，这里与之对齐。KP_* 是独立 keysym 区间
+     * （0xff80-0xffbd），不会与主键盘同名键混淆。 */
+    switch (event->nativeVirtualKey()) {
+        case 0xff8d: return RDP_SCANCODE_RETURN_KP; /* KP_Enter */
+        case 0xffaa: return RDP_SCANCODE_MULTIPLY;  /* KP_Multiply */
+        case 0xffab: return RDP_SCANCODE_ADD;       /* KP_Add */
+        case 0xffac: return RDP_SCANCODE_DECIMAL;   /* KP_Separator */
+        case 0xffad: return RDP_SCANCODE_SUBTRACT;  /* KP_Subtract */
+        case 0xffae: return RDP_SCANCODE_DECIMAL;   /* KP_Decimal */
+        case 0xffaf: return RDP_SCANCODE_DIVIDE;    /* KP_Divide */
+        case 0xffb0: return RDP_SCANCODE_NUMPAD0;   /* KP_0 */
+        case 0xffb1: return RDP_SCANCODE_NUMPAD1;   /* KP_1 */
+        case 0xffb2: return RDP_SCANCODE_NUMPAD2;   /* KP_2 */
+        case 0xffb3: return RDP_SCANCODE_NUMPAD3;   /* KP_3 */
+        case 0xffb4: return RDP_SCANCODE_NUMPAD4;   /* KP_4 */
+        case 0xffb5: return RDP_SCANCODE_NUMPAD5;   /* KP_5 */
+        case 0xffb6: return RDP_SCANCODE_NUMPAD6;   /* KP_6 */
+        case 0xffb7: return RDP_SCANCODE_NUMPAD7;   /* KP_7 */
+        case 0xffb8: return RDP_SCANCODE_NUMPAD8;   /* KP_8 */
+        case 0xffb9: return RDP_SCANCODE_NUMPAD9;   /* KP_9 */
+        /* NumLock 关闭时的 keysym，物理上是同一批数字键 */
+        case 0xff95: return RDP_SCANCODE_NUMPAD7;   /* KP_Home */
+        case 0xff96: return RDP_SCANCODE_NUMPAD4;   /* KP_Left */
+        case 0xff97: return RDP_SCANCODE_NUMPAD8;   /* KP_Up */
+        case 0xff98: return RDP_SCANCODE_NUMPAD6;   /* KP_Right */
+        case 0xff99: return RDP_SCANCODE_NUMPAD2;   /* KP_Down */
+        case 0xff9a: return RDP_SCANCODE_NUMPAD9;   /* KP_Prior */
+        case 0xff9b: return RDP_SCANCODE_NUMPAD3;   /* KP_Next */
+        case 0xff9c: return RDP_SCANCODE_NUMPAD1;   /* KP_End */
+        case 0xff9d: return RDP_SCANCODE_NUMPAD5;   /* KP_Begin */
+        case 0xff9e: return RDP_SCANCODE_NUMPAD0;   /* KP_Insert */
+        case 0xff9f: return RDP_SCANCODE_DECIMAL;   /* KP_Delete */
+        default: break;
     }
 
     switch (qkey) {
@@ -107,6 +127,11 @@ inline UINT to_freerdp_key_code(const QKeyEvent* event)
         case Qt::Key_CapsLock: return RDP_SCANCODE_CAPSLOCK;
         case Qt::Key_NumLock: return RDP_SCANCODE_NUMLOCK;
         case Qt::Key_ScrollLock: return RDP_SCANCODE_SCROLLLOCK;
+
+        /* 三者都是扩展扫描码；Pause 的按下需走专用接口，见 rdp-view-item.h */
+        case Qt::Key_Print: return RDP_SCANCODE_PRINTSCREEN;
+        case Qt::Key_Pause: return RDP_SCANCODE_PAUSE;
+        case Qt::Key_Menu: return RDP_SCANCODE_APPLICATION;
 
         case Qt::Key_Left: return RDP_SCANCODE_LEFT;
         case Qt::Key_Right: return RDP_SCANCODE_RIGHT;

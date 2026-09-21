@@ -39,9 +39,9 @@ static const CAM_MEDIA_FORMAT_INFO* getSupportedFormats(size_t* pCount)
 {
 	WINPR_ASSERT(pCount);
 
-	const CAM_MEDIA_FORMAT available[] = { CAM_MEDIA_FORMAT_H264, CAM_MEDIA_FORMAT_YUY2,
-		                                   CAM_MEDIA_FORMAT_NV12, CAM_MEDIA_FORMAT_I420,
-		                                   CAM_MEDIA_FORMAT_MJPG, CAM_MEDIA_FORMAT_RGB24,
+	const CAM_MEDIA_FORMAT available[] = { CAM_MEDIA_FORMAT_H264, CAM_MEDIA_FORMAT_MJPG,
+		                                   CAM_MEDIA_FORMAT_YUY2, CAM_MEDIA_FORMAT_NV12,
+		                                   CAM_MEDIA_FORMAT_I420, CAM_MEDIA_FORMAT_RGB24,
 		                                   CAM_MEDIA_FORMAT_RGB32 };
 
 	static CAM_MEDIA_FORMAT_INFO
@@ -313,6 +313,65 @@ static UINT ecam_dev_process_stop_streams_request(CameraDevice* dev,
 }
 
 /**
+ * @brief 由采集(输入)格式还原出候选表里的输入/输出格式配对
+ *
+ * 候选表按输出格式分组，且每个输入格式首次出现时的配对即为 →H264，
+ * 因此第一个匹配到的条目就代表该采集格式实际使用的输出格式。
+ */
+static CAM_MEDIA_FORMAT_INFO ecam_dev_format_info(const CAM_MEDIA_FORMAT_INFO* supported,
+                                                  size_t nSupported, CAM_MEDIA_FORMAT inputFormat)
+{
+	for (size_t i = 0; i < nSupported; i++)
+	{
+		if (supported[i].inputFormat == inputFormat)
+			return supported[i];
+	}
+
+	return (CAM_MEDIA_FORMAT_INFO){ inputFormat, CAM_MEDIA_FORMAT_H264 };
+}
+
+/**
+ * @brief 服务端选定媒体类型后，把条目还原成实际的采集格式
+ *
+ * 发送给服务端的每个条目其 Format 都被改写为 outputFormat，服务端回传的也是该值，
+ * 因此只能按上报清单里的 (width,height,fps) 反查条目原本的采集格式。
+ * 找不到匹配项时保持原有采集格式不变。
+ */
+static void ecam_dev_apply_reported_media_type(CameraDeviceStream* stream,
+                                               const CAM_MEDIA_TYPE_DESCRIPTION* mediaType)
+{
+	const CAM_MEDIA_TYPE_DESCRIPTION* exact = nullptr;
+	const CAM_MEDIA_TYPE_DESCRIPTION* sameSize = nullptr;
+
+	for (size_t i = 0; i < stream->nReportedMediaTypes; i++)
+	{
+		const CAM_MEDIA_TYPE_DESCRIPTION* reported = &stream->reportedMediaTypes[i];
+
+		if ((reported->Width != mediaType->Width) || (reported->Height != mediaType->Height))
+			continue;
+
+		if (!sameSize)
+			sameSize = reported;
+
+		if ((reported->FrameRateNumerator == mediaType->FrameRateNumerator) &&
+		    (reported->FrameRateDenominator == mediaType->FrameRateDenominator))
+		{
+			exact = reported;
+			break;
+		}
+	}
+
+	const CAM_MEDIA_TYPE_DESCRIPTION* selected = exact ? exact : sameSize;
+	if (!selected)
+		return;
+
+	size_t nSupportedFormats = 0;
+	const CAM_MEDIA_FORMAT_INFO* supportedFormats = getSupportedFormats(&nSupportedFormats);
+
+	stream->formats = ecam_dev_format_info(supportedFormats, nSupportedFormats, selected->Format);
+}
+
+/**
  * Function description
  *
  * @return 0 on success, otherwise a Win32 error code
@@ -359,6 +418,10 @@ static UINT ecam_dev_process_start_streams_request(CameraDevice* dev,
 	 * to be done before calling ecam_encoder_context_init
 	 */
 	stream->currMediaType = mediaType;
+
+	/* 回传的 Format 是 outputFormat，按上报清单把 (width,height,fps) 还原成采集格式，
+	 * 保证与服务端在媒体类型列表里选中的那条一致 */
+	ecam_dev_apply_reported_media_type(stream, &mediaType);
 
 	if (!ecam_encoder_context_init(stream))
 	{
@@ -616,7 +679,22 @@ static UINT ecam_dev_process_media_type_list_request(CameraDevice* dev,
 		goto error;
 	}
 
-	stream->formats = supportedFormats[formatIndex];
+	WINPR_ASSERT(nMediaTypes <= ARRAYSIZE(stream->reportedMediaTypes));
+
+	/* 先留一份采集(输入)格式的快照：下面会把每个条目的 Format 改写为 outputFormat 再发送，
+	 * 服务端回传的也是改写后的值，只能靠 (width,height,fps) 反查回采集格式 */
+	stream->nReportedMediaTypes = nMediaTypes;
+	for (size_t i = 0; i < nMediaTypes; i++)
+	{
+		stream->reportedMediaTypes[i] = mediaTypes[i];
+	}
+
+	if (stream->currMediaType.Format == 0)
+	{
+		/* 客户端默认采用清单首项，其采集格式即本流实际使用的采集格式 */
+		stream->formats =
+		    ecam_dev_format_info(supportedFormats, nSupportedFormats, mediaTypes[0].Format);
+	}
 
 	/* replacing inputFormat with outputFormat in mediaTypes before sending response */
 	for (size_t i = 0; i < nMediaTypes; i++)
@@ -627,7 +705,9 @@ static UINT ecam_dev_process_media_type_list_request(CameraDevice* dev,
 
 	if (stream->currMediaType.Format == 0)
 	{
-		/* saving 1st media type description for CurrentMediaTypeRequest */
+		/* saving 1st media type description for CurrentMediaTypeRequest。
+		 * 必须保存改写后的条目：服务端只认 outputFormat，若回给采集格式会与其媒体类型
+		 * 列表不一致，服务端将无法选中该格式导致摄像头打开失败 */
 		stream->currMediaType = mediaTypes[0];
 	}
 

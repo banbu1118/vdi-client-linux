@@ -1428,22 +1428,48 @@ static BOOL my_pre_connect(freerdp* instance)
 		}
 		else
 		{
-			auto ids = g_usbManager->selectedDeviceIds();
-			if (!ids.empty())
+			auto selected = g_usbManager->selectedDevices();
+			if (!selected.empty())
 			{
 				qf::log::info("rdp/pre-connect",
 				              "toolbar has {} device(s) selected, adding via toolbar",
-				              ids.size());
-				for (const auto& [vid, pid] : ids)
+				              selected.size());
+
+				/* urbdrc 语法：/usb:[dbg,][id:<vid>:<pid>#...,][addr:<bus>:<addr>#...,][auto]
+				 * 两条硬约束：
+				 *  1) id: 与 addr: 二选一 —— udevman 先看 devices_vid_pid，命中即 return，
+				 *     因此同一 VID:PID 出现多支时只能整次连接改用 addr:；
+				 *  2) 多设备必须写进同一条参数、用 '#' 分隔 —— 解析时对两个集合都是直接赋值，
+				 *     写多条同类参数只会保留最后一条。 */
+				const bool byAddr = g_usbManager->selectionNeedsAddr();
+				if (byAddr)
+					qf::log::warn("rdp/pre-connect",
+					              "duplicate VID:PID in selection, switching to addr: mode");
+
+				std::string value = byAddr ? "addr:" : "id:";
+				for (size_t i = 0; i < selected.size(); i++)
 				{
-					char devId[32];
-					snprintf(devId, sizeof(devId), "id:%04x:%04x", vid, pid);
-					const char* usb_args[] = {URBDRC_CHANNEL_NAME, devId, nullptr};
-					if (!freerdp_client_add_dynamic_channel(settings, 2, usb_args))
-						qf::log::warn("rdp/pre-connect", "USB redirect failed for {}", devId);
+					char item[32];
+					if (byAddr)
+						snprintf(item, sizeof(item), "%02x:%02x", selected[i].bus,
+						         selected[i].addr);
 					else
-						qf::log::info("rdp/pre-connect", "USB redirect enabled for {}", devId);
+						snprintf(item, sizeof(item), "%04x:%04x", selected[i].vid,
+						         selected[i].pid);
+					if (i > 0)
+						value += '#';
+					value += item;
 				}
+
+				/* freerdp_client_add_dynamic_channel() 对已存在的通道直接返回 TRUE
+				 * 且不追加任何参数，而这里要改的正是 CLI/.rdp 已注册的 urbdrc 通道，
+				 * 因此必须先删掉再重新添加，否则勾选不会生效。 */
+				freerdp_client_del_dynamic_channel(settings, URBDRC_CHANNEL_NAME);
+				const char* usb_args[] = {URBDRC_CHANNEL_NAME, value.c_str(), nullptr};
+				if (!freerdp_client_add_dynamic_channel(settings, 2, usb_args))
+					qf::log::warn("rdp/pre-connect", "USB redirect failed for {}", value);
+				else
+					qf::log::info("rdp/pre-connect", "USB redirect enabled for {}", value);
 			}
 			else
 			{
@@ -1524,6 +1550,84 @@ static BOOL my_pre_connect(freerdp* instance)
 	return TRUE;
 }
 
+/* =====================================================================
+ * 磁盘重定向 / USB 透传 的互斥状态
+ *
+ * 只要本次连接启用了磁盘重定向，落在自动挂载点下的存储卷就会被 rdpdr 以
+ * 盘符形式直接送进虚拟机（FreeRDP 官方机制），这些设备不应再重复走 USB 透传。
+ * 这里把重定向状态同步给 USBManager，供其列表置灰与挂载点标注。
+ * ===================================================================== */
+static void updateDriveRedirectState(rdpSettings* settings)
+{
+	if (!settings || !g_usbManager)
+		return;
+
+	bool wildcard = false;
+	QStringList paths;
+
+	/* drivestoredirect:s:* 等形式的原始值不会被 FreeRDP 清空，可直接读取 */
+	const char* drivesToRedirect =
+	    freerdp_settings_get_string(settings, FreeRDP_DrivesToRedirect);
+	if (drivesToRedirect && *drivesToRedirect)
+	{
+		std::string value(drivesToRedirect);
+		size_t pos = 0;
+		while (pos <= value.size())
+		{
+			const size_t next = value.find(';', pos);
+			std::string tok = value.substr(
+			    pos, (next == std::string::npos) ? std::string::npos : next - pos);
+			pos = (next == std::string::npos) ? value.size() + 1 : next + 1;
+
+			if (tok.find('*') != std::string::npos)
+			{
+				wildcard = true;
+				break;
+			}
+
+			/* <label>(<path>) 或 <path>(<label>)：取出其中的路径部分 */
+			const size_t open = tok.find('(');
+			if (open != std::string::npos)
+			{
+				const size_t close = tok.find(')', open);
+				if (close != std::string::npos && close > open + 1)
+					tok = tok.substr(open + 1, close - open - 1);
+			}
+			if (!tok.empty() && tok[0] == '/')
+				paths << QString::fromStdString(tok);
+		}
+	}
+
+	/* 设备表是最终事实：/drives 通配设备（Path == "*"）、/drive:NAME,path、
+	 * drivestoredirect 解析结果都会体现在这里 */
+	const UINT32 count = freerdp_settings_get_uint32(settings, FreeRDP_DeviceCount);
+	for (UINT32 i = 0; i < count; i++)
+	{
+		const RDPDR_DEVICE* device = static_cast<const RDPDR_DEVICE*>(
+		    freerdp_settings_get_pointer_array(settings, FreeRDP_DeviceArray, i));
+		if (!device || (device->Type != RDPDR_DTYP_FILESYSTEM))
+			continue;
+
+		const RDPDR_DRIVE* drive = reinterpret_cast<const RDPDR_DRIVE*>(device);
+		if (!drive->Path)
+			continue;
+
+		if (strcmp(drive->Path, "*") == 0)
+		{
+			wildcard = true;
+			break;
+		}
+		/* "%" 为用户主目录，非路径字面量 */
+		if (strcmp(drive->Path, "%") == 0 || drive->Path[0] != '/')
+			continue;
+		paths << QString::fromStdString(drive->Path);
+	}
+
+	g_usbManager->setDiskRedirectState(wildcard, paths);
+	qf::log::info("rdp/post-connect", "disk redirect state: wildcard={} explicit_paths={}",
+	              wildcard, paths.size());
+}
+
 static BOOL my_post_connect(freerdp* instance)
 {
 	rdpUpdate* update = instance->context->update;
@@ -1584,6 +1688,11 @@ static BOOL my_post_connect(freerdp* instance)
 	}
 
 	g_rdpViewItem->setFreeRDP_context(instance->context);
+
+	/* 此时 freerdp_client_load_addins() 已经执行（freerdp_connect_begin →
+	 * utils_reload_channels → LoadChannels），设备表里能看到本次连接最终生效的
+	 * 磁盘重定向配置，据此同步给 USB 列表做置灰与标注。 */
+	updateDriveRedirectState(instance->context->settings);
 
 	/*
 	 * 连接建立后立即发送窗口实际物理分辨率给服务器。
@@ -2036,6 +2145,9 @@ int main(int argc, char* argv[])
 	WLog_SetLogLevel(WLog_GetRoot(), WLOG_WARN);
 
 	qf::log::init();
+	/* 设置 Wayland app_id（Qt 会去掉 .desktop 后缀）。GNOME 按 app_id 匹配已安装的
+	 * qf-client.desktop，并据此记录"允许抑制快捷键"的授权，名字必须与随包安装的一致。 */
+	QGuiApplication::setDesktopFileName(QStringLiteral("qf-client"));
 	QGuiApplication app(argc, argv);
 	QQmlApplicationEngine engine;
 
