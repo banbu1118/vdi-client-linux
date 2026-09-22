@@ -120,6 +120,34 @@ inline UINT to_freerdp_key_code(const QKeyEvent* event)
         case Qt::Key_Period: return RDP_SCANCODE_OEM_PERIOD;
         case Qt::Key_Slash: return RDP_SCANCODE_OEM_2;
 
+        /* 按住 Shift 时 Qt 的 key() 已经是「Shift 层」的字符键位（Shift+1 报
+         * Key_Exclam 而不是 Key_1），上面这些未加 Shift 的条目一个都命中不了，
+         * 会掉进 UNKNOWN 落到 unicode 回退分支。这里把它们折算回基础键的扫描码，
+         * 与官方 X11 客户端（按物理 keycode 取扫描码）一致：发基础键 + 已同步的
+         * LSHIFT 状态由远端自己换算成 '!'、'@' 等字符，既保留 Ctrl+Shift+数字
+         * 这类快捷键的组合键语义，也不依赖服务器的 unicode 能力。 */
+        case Qt::Key_Exclam: return RDP_SCANCODE_KEY_1;
+        case Qt::Key_At: return RDP_SCANCODE_KEY_2;
+        case Qt::Key_NumberSign: return RDP_SCANCODE_KEY_3;
+        case Qt::Key_Dollar: return RDP_SCANCODE_KEY_4;
+        case Qt::Key_Percent: return RDP_SCANCODE_KEY_5;
+        case Qt::Key_AsciiCircum: return RDP_SCANCODE_KEY_6;
+        case Qt::Key_Ampersand: return RDP_SCANCODE_KEY_7;
+        case Qt::Key_Asterisk: return RDP_SCANCODE_KEY_8;
+        case Qt::Key_ParenLeft: return RDP_SCANCODE_KEY_9;
+        case Qt::Key_ParenRight: return RDP_SCANCODE_KEY_0;
+        case Qt::Key_Underscore: return RDP_SCANCODE_OEM_MINUS;
+        case Qt::Key_Plus: return RDP_SCANCODE_OEM_PLUS;
+        case Qt::Key_BraceLeft: return RDP_SCANCODE_OEM_4;
+        case Qt::Key_BraceRight: return RDP_SCANCODE_OEM_6;
+        case Qt::Key_Bar: return RDP_SCANCODE_OEM_5;
+        case Qt::Key_Colon: return RDP_SCANCODE_OEM_1;
+        case Qt::Key_QuoteDbl: return RDP_SCANCODE_OEM_7;
+        case Qt::Key_AsciiTilde: return RDP_SCANCODE_OEM_3;
+        case Qt::Key_Less: return RDP_SCANCODE_OEM_COMMA;
+        case Qt::Key_Greater: return RDP_SCANCODE_OEM_PERIOD;
+        case Qt::Key_Question: return RDP_SCANCODE_OEM_2;
+
         case Qt::Key_Shift: return RDP_SCANCODE_LSHIFT;
         case Qt::Key_Control: return RDP_SCANCODE_LCONTROL;
         case Qt::Key_Alt: return RDP_SCANCODE_LMENU;
